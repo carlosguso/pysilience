@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -354,6 +355,21 @@ class TestTimeoutClass:
         """duration property returns configured value."""
         t = Timeout(TimeoutConfig(duration=42.0))
         assert t.duration == 42.0
+
+    def test_executor_shutdown_when_submit_raises(self) -> None:
+        """Executor is shut down even when submit() raises."""
+        t = Timeout(TimeoutConfig(duration=1.0))
+        mock_executor = MagicMock()
+        mock_executor.submit.side_effect = RuntimeError("submit failed")
+
+        with patch(
+            "pysilience.timeout.concurrent.futures.ThreadPoolExecutor",
+            return_value=mock_executor,
+        ):
+            with pytest.raises(RuntimeError, match="submit failed"):
+                t.execute(lambda: "ok")
+
+        mock_executor.shutdown.assert_called_once()
 
 
 # ============================================================================

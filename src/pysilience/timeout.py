@@ -233,9 +233,9 @@ class Timeout(Generic[P, R]):
     def _execute_with_thread(self, func: Callable[[], R], start_time: float) -> R:
         """Execute using a thread pool for timeout (works everywhere)."""
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(func)
         timed_out = False
         try:
+            future = executor.submit(func)
             result = future.result(timeout=self.config.duration)
             elapsed = time.monotonic() - start_time
             self._emit_event(
