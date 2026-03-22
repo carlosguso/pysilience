@@ -188,6 +188,7 @@ class Timeout(Generic[P, R]):
         self.config = config or TimeoutConfig()
         self.name = name or "timeout"
         self._event_listeners: list[Callable[[TimeoutEvent], None]] = []
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def duration(self) -> float:
@@ -209,6 +210,15 @@ class Timeout(Generic[P, R]):
                 listener(event)
             except Exception:
                 pass  # Don't let listener errors affect the main flow
+
+    def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Remove task from tracking set and consume any exception to avoid warnings."""
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass  # Expected when task is cancelled
 
     def execute(self, func: Callable[[], R]) -> R:
         """Execute a callable with timeout protection.
@@ -353,8 +363,16 @@ class Timeout(Generic[P, R]):
         """
         start_time = time.monotonic()
 
-        # Shield prevents cancellation when cancel_running_future=False
-        awaitable = asyncio.shield(coro) if not self.config.cancel_running_future else coro
+        if not self.config.cancel_running_future:
+            # Create task explicitly to avoid GC: the event loop keeps only weak refs.
+            # Without a strong ref, a task created internally by shield() can be
+            # garbage-collected when the shield is cancelled on timeout.
+            task = asyncio.create_task(coro)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._on_background_task_done)
+            awaitable = asyncio.shield(task)
+        else:
+            awaitable = coro
 
         try:
             result = await asyncio.wait_for(awaitable, timeout=self.config.duration)
