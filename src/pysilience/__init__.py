@@ -20,14 +20,14 @@ Basic Usage:
     ...     ...
 
 Each pattern can also be imported individually:
-    >>> from pysilience.timeout import Timeout, TimeoutConfig, TimeoutError
+    >>> from pysilience.timeout import Timeout, TimeoutConfig, OperationTimeout
 """
 
 from pysilience._version import __version__
 from pysilience.timeout import (
+    OperationTimeout,
     Timeout,
     TimeoutConfig,
-    TimeoutError,
     TimeoutEvent,
     TimeoutEventType,
     timeout,
@@ -40,7 +40,7 @@ __all__ = [
     "timeout",
     "Timeout",
     "TimeoutConfig",
-    "TimeoutError",
+    "OperationTimeout",
     "TimeoutEvent",
     "TimeoutEventType",
 ]
