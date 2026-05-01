@@ -5,15 +5,17 @@ This file is self-contained and can be copied directly into your project.
 No external dependencies required (Python 3.10+ stdlib only).
 
 Usage:
-    from timeout import timeout, TimeoutConfig, TimeoutError
-    
+    from timeout import timeout, TimeoutConfig, OperationTimeout
+
     @timeout(duration=5.0)
     def slow_function():
         ...
-    
+
     @timeout(duration=10.0)
     async def slow_async_function():
         ...
+
+    # OperationTimeout is the exception raised when the time limit is exceeded.
 
 License: MIT
 """
@@ -27,11 +29,11 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import (
     Any,
-    Callable,
     Generic,
     ParamSpec,
     TypeVar,
@@ -42,7 +44,7 @@ __all__ = [
     "timeout",
     "Timeout",
     "TimeoutConfig",
-    "TimeoutError",
+    "OperationTimeout",
     "TimeoutEvent",
     "TimeoutEventType",
 ]
@@ -58,9 +60,9 @@ T = TypeVar("T")
 # ============================================================================
 
 
-class TimeoutError(Exception):
+class OperationTimeout(Exception):  # noqa: N818
     """Raised when an operation exceeds its time limit.
-    
+
     Attributes:
         name: Name of the timeout instance that raised this error.
         duration: The timeout duration that was exceeded (in seconds).
@@ -95,15 +97,15 @@ class TimeoutError(Exception):
 @dataclass(frozen=True, slots=True)
 class TimeoutConfig:
     """Configuration for timeout behavior.
-    
+
     Attributes:
         duration: Maximum time allowed for the operation (in seconds).
-        cancel_running_future: For async operations, whether to cancel the 
+        cancel_running_future: For async operations, whether to cancel the
             underlying task when timeout occurs. Default True.
         use_signals: For sync operations on Unix, whether to use SIGALRM for
             timeout (more reliable but only works in main thread). If False,
             uses threading-based timeout. Default False.
-    
+
     Example:
         >>> config = TimeoutConfig(duration=30.0)
         >>> config = TimeoutConfig(duration=5.0, cancel_running_future=False)
@@ -134,7 +136,7 @@ class TimeoutEventType(Enum):
 @dataclass(frozen=True, slots=True)
 class TimeoutEvent:
     """Event emitted by the Timeout for observability.
-    
+
     Attributes:
         event_type: The type of event that occurred.
         name: Name of the timeout instance.
@@ -157,15 +159,15 @@ class TimeoutEvent:
 
 class Timeout(Generic[P, R]):
     """Timeout implementation that limits the execution time of operations.
-    
+
     Can be used as a decorator or as a context manager for wrapping operations.
     Supports both synchronous and asynchronous functions.
-    
+
     Example as decorator:
         >>> @Timeout(TimeoutConfig(duration=5.0))
         ... def slow_operation():
-        ...     time.sleep(10)  # Will raise TimeoutError after 5s
-        
+        ...     time.sleep(10)  # Will raise OperationTimeout after 5s
+
     Example with execute:
         >>> t = Timeout(TimeoutConfig(duration=5.0), name="my-timeout")
         >>> result = t.execute(lambda: slow_operation())
@@ -178,7 +180,7 @@ class Timeout(Generic[P, R]):
         name: str | None = None,
     ) -> None:
         """Initialize the Timeout.
-        
+
         Args:
             config: Configuration for timeout behavior. Uses defaults if None.
             name: Optional name for this timeout instance (for logging/metrics).
@@ -186,6 +188,7 @@ class Timeout(Generic[P, R]):
         self.config = config or TimeoutConfig()
         self.name = name or "timeout"
         self._event_listeners: list[Callable[[TimeoutEvent], None]] = []
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def duration(self) -> float:
@@ -194,7 +197,7 @@ class Timeout(Generic[P, R]):
 
     def on_event(self, listener: Callable[[TimeoutEvent], None]) -> None:
         """Register a listener for timeout events.
-        
+
         Args:
             listener: Callback function that receives TimeoutEvent objects.
         """
@@ -208,17 +211,26 @@ class Timeout(Generic[P, R]):
             except Exception:
                 pass  # Don't let listener errors affect the main flow
 
+    def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Remove task from tracking set and consume any exception to avoid warnings."""
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass  # Expected when task is cancelled
+
     def execute(self, func: Callable[[], R]) -> R:
         """Execute a callable with timeout protection.
-        
+
         Args:
             func: A no-argument callable to execute.
-            
+
         Returns:
             The return value of the callable.
-            
+
         Raises:
-            TimeoutError: If the operation exceeds the time limit.
+            OperationTimeout: If the operation exceeds the time limit.
         """
         start_time = time.monotonic()
 
@@ -230,58 +242,62 @@ class Timeout(Generic[P, R]):
 
     def _execute_with_thread(self, func: Callable[[], R], start_time: float) -> R:
         """Execute using a thread pool for timeout (works everywhere)."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        timed_out = False
+        try:
             future = executor.submit(func)
-            try:
-                result = future.result(timeout=self.config.duration)
-                elapsed = time.monotonic() - start_time
-                self._emit_event(
-                    TimeoutEvent(
-                        event_type=TimeoutEventType.SUCCESS,
-                        name=self.name,
-                        duration_limit=self.config.duration,
-                        elapsed=elapsed,
-                    )
-                )
-                return result
-            except concurrent.futures.TimeoutError:
-                elapsed = time.monotonic() - start_time
-                # Note: We can't truly cancel the thread, it will continue running
-                error = TimeoutError(
-                    f"Operation timed out after {elapsed:.2f}s",
+            result = future.result(timeout=self.config.duration)
+            elapsed = time.monotonic() - start_time
+            self._emit_event(
+                TimeoutEvent(
+                    event_type=TimeoutEventType.SUCCESS,
                     name=self.name,
-                    duration=self.config.duration,
+                    duration_limit=self.config.duration,
                     elapsed=elapsed,
                 )
-                self._emit_event(
-                    TimeoutEvent(
-                        event_type=TimeoutEventType.TIMEOUT,
-                        name=self.name,
-                        duration_limit=self.config.duration,
-                        elapsed=elapsed,
-                        exception=error,
-                    )
+            )
+            return result
+        except concurrent.futures.TimeoutError:
+            timed_out = True
+            elapsed = time.monotonic() - start_time
+            error = OperationTimeout(
+                f"Operation timed out after {elapsed:.2f}s",
+                name=self.name,
+                duration=self.config.duration,
+                elapsed=elapsed,
+            )
+            self._emit_event(
+                TimeoutEvent(
+                    event_type=TimeoutEventType.TIMEOUT,
+                    name=self.name,
+                    duration_limit=self.config.duration,
+                    elapsed=elapsed,
+                    exception=error,
                 )
-                raise error from None
-            except Exception as e:
-                elapsed = time.monotonic() - start_time
-                self._emit_event(
-                    TimeoutEvent(
-                        event_type=TimeoutEventType.ERROR,
-                        name=self.name,
-                        duration_limit=self.config.duration,
-                        elapsed=elapsed,
-                        exception=e,
-                    )
+            )
+            raise error from None
+        except Exception as e:
+            elapsed = time.monotonic() - start_time
+            self._emit_event(
+                TimeoutEvent(
+                    event_type=TimeoutEventType.ERROR,
+                    name=self.name,
+                    duration_limit=self.config.duration,
+                    elapsed=elapsed,
+                    exception=e,
                 )
-                raise
+            )
+            raise
+        finally:
+            # wait=False on timeout returns control promptly; worker continues in background
+            executor.shutdown(wait=not timed_out)
 
     def _execute_with_signal(self, func: Callable[[], R], start_time: float) -> R:
         """Execute using SIGALRM for timeout (Unix main thread only)."""
 
         def _timeout_handler(signum: int, frame: Any) -> None:
             elapsed = time.monotonic() - start_time
-            raise TimeoutError(
+            raise OperationTimeout(
                 f"Operation timed out after {elapsed:.2f}s",
                 name=self.name,
                 duration=self.config.duration,
@@ -304,7 +320,7 @@ class Timeout(Generic[P, R]):
                 )
             )
             return result
-        except TimeoutError as e:
+        except OperationTimeout as e:
             elapsed = time.monotonic() - start_time
             self._emit_event(
                 TimeoutEvent(
@@ -335,20 +351,31 @@ class Timeout(Generic[P, R]):
 
     async def execute_async(self, coro: Any) -> R:
         """Execute a coroutine with timeout protection.
-        
+
         Args:
             coro: A coroutine to execute.
-            
+
         Returns:
             The return value of the coroutine.
-            
+
         Raises:
-            TimeoutError: If the operation exceeds the time limit.
+            OperationTimeout: If the operation exceeds the time limit.
         """
         start_time = time.monotonic()
 
+        if not self.config.cancel_running_future:
+            # Create task explicitly to avoid GC: the event loop keeps only weak refs.
+            # Without a strong ref, a task created internally by shield() can be
+            # garbage-collected when the shield is cancelled on timeout.
+            task = asyncio.create_task(coro)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._on_background_task_done)
+            awaitable = asyncio.shield(task)
+        else:
+            awaitable = coro
+
         try:
-            result = await asyncio.wait_for(coro, timeout=self.config.duration)
+            result = await asyncio.wait_for(awaitable, timeout=self.config.duration)
             elapsed = time.monotonic() - start_time
             self._emit_event(
                 TimeoutEvent(
@@ -361,7 +388,7 @@ class Timeout(Generic[P, R]):
             return result
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - start_time
-            error = TimeoutError(
+            error = OperationTimeout(
                 f"Operation timed out after {elapsed:.2f}s",
                 name=self.name,
                 duration=self.config.duration,
@@ -392,7 +419,7 @@ class Timeout(Generic[P, R]):
 
     def __call__(self, func: Callable[P, R]) -> Callable[P, R]:
         """Use Timeout as a decorator.
-        
+
         Example:
             >>> t = Timeout(TimeoutConfig(duration=5.0))
             >>> @t
@@ -446,33 +473,33 @@ def timeout(
     use_signals: bool = False,
 ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator to wrap a function with timeout protection.
-    
+
     Can be used with or without arguments:
-    
+
         @timeout
         def my_func():
             ...
-            
+
         @timeout(duration=5.0)
         def my_func():
             ...
-            
+
         @timeout(duration=10.0, name="api-call")
         async def my_async_func():
             ...
-    
+
     Args:
         func: The function to wrap (when used without parentheses).
         duration: Maximum time allowed for the operation (in seconds).
         name: Optional name for this timeout instance.
         cancel_running_future: For async, whether to cancel on timeout.
         use_signals: For sync on Unix, whether to use SIGALRM.
-        
+
     Returns:
-        The wrapped function that will raise TimeoutError if duration exceeded.
-        
-    Raises:
-        TimeoutError: When the wrapped function exceeds the time limit.
+        The wrapped function that will raise OperationTimeout if duration exceeded.
+
+        Raises:
+            OperationTimeout: When the wrapped function exceeds the time limit.
     """
     config = TimeoutConfig(
         duration=duration,
@@ -527,12 +554,12 @@ def create_timeout(
     register: bool = True,
 ) -> Timeout[Any, Any]:
     """Factory function to create and optionally register a Timeout instance.
-    
+
     Args:
         config: Configuration for timeout behavior.
         name: Name for this timeout instance (required for registry).
         register: Whether to register with pysilience core registry.
-        
+
     Returns:
         A configured Timeout instance.
     """

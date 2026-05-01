@@ -7,7 +7,7 @@ Run with: python examples/basic_usage.py
 import asyncio
 import time
 
-from pysilience import timeout, Timeout, TimeoutConfig, TimeoutError
+from pysilience import timeout, Timeout, TimeoutConfig, OperationTimeout
 
 
 def example_basic_timeout() -> None:
@@ -34,7 +34,7 @@ def example_timeout_exceeded() -> None:
 
     try:
         very_slow_operation()
-    except TimeoutError as e:
+    except OperationTimeout as e:
         print(f"Caught timeout: {e}")
         print(f"  Duration limit: {e.duration}s")
         print(f"  Elapsed: {e.elapsed:.2f}s")
@@ -103,7 +103,7 @@ async def example_async_timeout_exceeded() -> None:
 
     try:
         await slow_async()
-    except TimeoutError as e:
+    except OperationTimeout as e:
         print(f"Caught async timeout: {e}")
 
 

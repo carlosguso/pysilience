@@ -8,19 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from pysilience.timeout import (
+    OperationTimeout,
     Timeout,
     TimeoutConfig,
-    TimeoutError,
     TimeoutEvent,
     TimeoutEventType,
     timeout,
 )
-
 
 # ============================================================================
 # CONFIGURATION TESTS
@@ -86,7 +85,7 @@ class TestSyncTimeout:
             time.sleep(1.0)
             return "never returned"
 
-        with pytest.raises(TimeoutError) as exc_info:
+        with pytest.raises(OperationTimeout) as exc_info:
             slow_function()
 
         assert exc_info.value.duration == 0.1
@@ -135,19 +134,41 @@ class TestSyncTimeout:
         assert add(a=10, b=20) == 30
 
     def test_timeout_error_attributes(self) -> None:
-        """TimeoutError has correct attributes."""
+        """OperationTimeout has correct attributes."""
 
         @timeout(duration=0.1, name="test-timeout")
         def slow() -> None:
             time.sleep(1.0)
 
-        with pytest.raises(TimeoutError) as exc_info:
+        with pytest.raises(OperationTimeout) as exc_info:
             slow()
 
         error = exc_info.value
         assert error.name == "test-timeout"
         assert error.duration == 0.1
         assert error.elapsed is not None
+
+    def test_sync_timeout_returns_promptly(self) -> None:
+        """Sync timeout returns control within ~timeout, not timeout + func duration.
+
+        Bug: ThreadPoolExecutor context manager blocks on shutdown(wait=True)
+        until the worker thread finishes. We must return promptly after timeout.
+        """
+        timeout_duration = 0.2
+        sleep_duration = 2.0  # Much longer than timeout
+
+        t = Timeout(TimeoutConfig(duration=timeout_duration, use_signals=False))
+
+        start = time.monotonic()
+        with pytest.raises(OperationTimeout):
+            t.execute(lambda: time.sleep(sleep_duration))
+        elapsed = time.monotonic() - start
+
+        # Should return within timeout + small buffer (e.g. 0.5s), NOT ~2.2s
+        assert elapsed < timeout_duration + 0.5, (
+            f"Timeout should return promptly, got {elapsed:.2f}s "
+            f"(expected < {timeout_duration + 0.5}s)"
+        )
 
 
 # ============================================================================
@@ -179,7 +200,7 @@ class TestAsyncTimeout:
             await asyncio.sleep(1.0)
             return "never returned"
 
-        with pytest.raises(TimeoutError) as exc_info:
+        with pytest.raises(OperationTimeout) as exc_info:
             await slow_async()
 
         assert exc_info.value.duration == 0.1
@@ -206,6 +227,45 @@ class TestAsyncTimeout:
 
         result = await async_add(5, 7)
         assert result == 12
+
+    @pytest.mark.asyncio
+    async def test_cancel_running_future_false_task_continues(self) -> None:
+        """With cancel_running_future=False, coroutine continues after timeout."""
+
+        completed = False
+
+        async def slow() -> None:
+            nonlocal completed
+            await asyncio.sleep(0.5)
+            completed = True
+
+        t = Timeout(TimeoutConfig(duration=0.1, cancel_running_future=False))
+
+        with pytest.raises(OperationTimeout):
+            await t.execute_async(slow())
+
+        # Give the shielded task time to complete
+        await asyncio.sleep(0.6)
+        assert completed is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_running_future_true_task_cancelled(self) -> None:
+        """With cancel_running_future=True (default), coroutine is cancelled on timeout."""
+
+        completed = False
+
+        async def slow() -> None:
+            nonlocal completed
+            await asyncio.sleep(0.5)
+            completed = True
+
+        t = Timeout(TimeoutConfig(duration=0.1, cancel_running_future=True))
+
+        with pytest.raises(OperationTimeout):
+            await t.execute_async(slow())
+
+        await asyncio.sleep(0.6)
+        assert completed is False
 
 
 # ============================================================================
@@ -274,10 +334,10 @@ class TestTimeoutClass:
         assert result == "direct call"
 
     def test_execute_sync_timeout(self) -> None:
-        """execute() raises TimeoutError."""
+        """execute() raises OperationTimeout."""
         t = Timeout(TimeoutConfig(duration=0.1))
 
-        with pytest.raises(TimeoutError):
+        with pytest.raises(OperationTimeout):
             t.execute(lambda: time.sleep(1.0))
 
     @pytest.mark.asyncio
@@ -295,6 +355,21 @@ class TestTimeoutClass:
         """duration property returns configured value."""
         t = Timeout(TimeoutConfig(duration=42.0))
         assert t.duration == 42.0
+
+    def test_executor_shutdown_when_submit_raises(self) -> None:
+        """Executor is shut down even when submit() raises."""
+        t = Timeout(TimeoutConfig(duration=1.0))
+        mock_executor = MagicMock()
+        mock_executor.submit.side_effect = RuntimeError("submit failed")
+
+        with patch(
+            "pysilience.timeout.concurrent.futures.ThreadPoolExecutor",
+            return_value=mock_executor,
+        ):
+            with pytest.raises(RuntimeError, match="submit failed"):
+                t.execute(lambda: "ok")
+
+        mock_executor.shutdown.assert_called_once()
 
 
 # ============================================================================
@@ -336,13 +411,13 @@ class TestTimeoutEvents:
         def slow_func() -> None:
             time.sleep(1.0)
 
-        with pytest.raises(TimeoutError):
+        with pytest.raises(OperationTimeout):
             slow_func()
 
         assert len(events) == 1
         assert events[0].event_type == TimeoutEventType.TIMEOUT
         assert events[0].exception is not None
-        assert isinstance(events[0].exception, TimeoutError)
+        assert isinstance(events[0].exception, OperationTimeout)
 
     def test_error_event(self) -> None:
         """Error event is emitted on exception."""
@@ -419,7 +494,7 @@ class TestEdgeCases:
         try:
             result = instant()
             assert result == "fast"
-        except TimeoutError:
+        except OperationTimeout:
             pass  # Also acceptable
 
     def test_timeout_with_none_return(self) -> None:
@@ -480,18 +555,18 @@ class TestEdgeCases:
 # ============================================================================
 
 
-class TestTimeoutErrorClass:
-    """Tests for the TimeoutError exception class."""
+class TestOperationTimeoutClass:
+    """Tests for the OperationTimeout exception class."""
 
     def test_basic_error(self) -> None:
-        error = TimeoutError("Operation timed out")
+        error = OperationTimeout("Operation timed out")
         assert str(error) == "Operation timed out"
         assert error.name is None
         assert error.duration is None
         assert error.elapsed is None
 
     def test_error_with_attributes(self) -> None:
-        error = TimeoutError(
+        error = OperationTimeout(
             "Timed out",
             name="my-timeout",
             duration=5.0,
@@ -502,7 +577,7 @@ class TestTimeoutErrorClass:
         assert error.elapsed == 5.1
 
     def test_error_str_with_name_and_duration(self) -> None:
-        error = TimeoutError(
+        error = OperationTimeout(
             "Operation failed",
             name="api-call",
             duration=10.0,
@@ -510,3 +585,9 @@ class TestTimeoutErrorClass:
         error_str = str(error)
         assert "api-call" in error_str
         assert "10.0s" in error_str
+
+    def test_operation_timeout_does_not_shadow_builtin(self) -> None:
+        """OperationTimeout does not shadow built-in TimeoutError (OSError subclass)."""
+        import builtins
+
+        assert OperationTimeout is not builtins.TimeoutError
