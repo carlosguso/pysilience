@@ -7,23 +7,32 @@ Each pattern is self-contained and can be copied directly into your project.
 
 Patterns:
     - timeout: Limits execution time of operations
-    - retry: Automatically retries failed operations (coming soon)
+    - retry: Automatically retries failed operations
     - circuitbreaker: Prevents cascading failures (coming soon)
     - ratelimiter: Limits rate of operations (coming soon)
     - bulkhead: Limits concurrent executions (coming soon)
 
 Basic Usage:
     >>> from pysilience import timeout
-    >>> 
+    >>>
     >>> @timeout(duration=5.0)
     ... def slow_operation():
     ...     ...
 
 Each pattern can also be imported individually:
     >>> from pysilience.timeout import Timeout, TimeoutConfig, OperationTimeout
+    >>> from pysilience.retry import Retry, RetryConfig, RetriesExhausted
 """
 
 from pysilience._version import __version__
+from pysilience.retry import (
+    RetriesExhausted,
+    Retry,
+    RetryConfig,
+    RetryEvent,
+    RetryEventType,
+    retry,
+)
 from pysilience.timeout import (
     OperationTimeout,
     Timeout,
@@ -43,4 +52,11 @@ __all__ = [
     "OperationTimeout",
     "TimeoutEvent",
     "TimeoutEventType",
+    # Retry
+    "retry",
+    "Retry",
+    "RetryConfig",
+    "RetriesExhausted",
+    "RetryEvent",
+    "RetryEventType",
 ]
