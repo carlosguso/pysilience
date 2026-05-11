@@ -184,6 +184,18 @@ class TestAsyncBulkhead:
         await asyncio.gather(t1, t2)
         assert order == ["a", "b"]
 
+    @pytest.mark.asyncio
+    async def test_async_timed_wait_no_lock_corruption(self) -> None:
+        """Guard against cancel/wait races leaving asyncio primitives inconsistent."""
+        for _ in range(30):
+            bh = Bulkhead(BulkheadConfig(max_concurrent=2, max_wait=0.02))
+
+            async def work() -> None:
+                await asyncio.sleep(0.001)
+
+            tasks = [asyncio.create_task(bh.execute_async(work)) for _ in range(8)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
 
 class TestBulkheadEvents:
     def test_sync_events(self) -> None:
