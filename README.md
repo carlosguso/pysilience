@@ -4,7 +4,7 @@ A lightweight fault tolerance library for Python, inspired by [resilience4j](htt
 
 ## Features
 
-- **Zero dependencies**: Uses only Python standard library
+- **Minimal dependencies**: Core patterns use only the Python standard library; optional backends (e.g. Redis) are installed separately
 - **Copy-paste friendly**: Each pattern is self-contained in a single file
 - **Async support**: Works with both sync and async functions
 - **Type hints**: Full typing support for better IDE experience

@@ -1,7 +1,7 @@
 """
 Pysilience - Fallback Pattern
 =============================
-Provides an alternative result when the primary operation fails (stdlib only; Python 3.10+).
+Provides an alternative result when the primary operation fails (Python 3.10+, stdlib only).
 
 Usage:
     from fallback import fallback, FallbackConfig

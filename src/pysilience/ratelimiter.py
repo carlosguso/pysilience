@@ -2,7 +2,7 @@
 Pysilience - Rate Limiter Pattern
 =================================
 Controls the rate at which operations are executed using configurable
-algorithms (stdlib only; Python 3.10+).
+algorithms (Python 3.10+, stdlib only).
 
 Available algorithms (see :class:`RateLimitAlgorithm`):
 
