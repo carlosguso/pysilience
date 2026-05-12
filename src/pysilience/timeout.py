@@ -1,8 +1,7 @@
 """
 Pysilience - Timeout Pattern
 ============================
-This file is self-contained and can be copied directly into your project.
-No external dependencies required (Python 3.10+ stdlib only).
+Limits how long a sync or async operation may run (stdlib only; Python 3.10+).
 
 Usage:
     from timeout import timeout, TimeoutConfig, OperationTimeout
@@ -24,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import functools
 import signal
 import sys
@@ -37,8 +37,12 @@ from typing import (
     Generic,
     ParamSpec,
     TypeVar,
+    cast,
     overload,
 )
+
+from pysilience.core.listeners import notify_listeners
+from pysilience.core.registry import register as register_pattern
 
 __all__ = [
     "timeout",
@@ -47,6 +51,7 @@ __all__ = [
     "OperationTimeout",
     "TimeoutEvent",
     "TimeoutEventType",
+    "create_timeout",
 ]
 
 # Type variables for generic typing
@@ -205,20 +210,14 @@ class Timeout(Generic[P, R]):
 
     def _emit_event(self, event: TimeoutEvent) -> None:
         """Emit an event to all registered listeners."""
-        for listener in self._event_listeners:
-            try:
-                listener(event)
-            except Exception:
-                pass  # Don't let listener errors affect the main flow
+        notify_listeners(self._event_listeners, event)
 
     def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
         """Remove task from tracking set and consume any exception to avoid warnings."""
         self._background_tasks.discard(task)
         if not task.cancelled():
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 task.exception()
-            except asyncio.CancelledError:
-                pass  # Expected when task is cancelled
 
     def execute(self, func: Callable[[], R]) -> R:
         """Execute a callable with timeout protection.
@@ -385,7 +384,7 @@ class Timeout(Generic[P, R]):
                     elapsed=elapsed,
                 )
             )
-            return result
+            return cast(R, result)
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - start_time
             error = OperationTimeout(
@@ -506,7 +505,7 @@ def timeout(
         cancel_running_future=cancel_running_future,
         use_signals=use_signals,
     )
-    timeout_instance = Timeout(config, name=name)
+    timeout_instance: Timeout[P, R] = Timeout(config, name=name)
 
     def decorator(fn: Callable[P, R]) -> Callable[P, R]:
         return timeout_instance(fn)
@@ -534,38 +533,14 @@ def _can_use_signals() -> bool:
         return False
 
 
-# ============================================================================
-# OPTIONAL: INTEGRATION WITH PYSILIENCE CORE (if available)
-# ============================================================================
-
-try:
-    from pysilience.core.registry import register as _register
-
-    _HAS_CORE = True
-except ImportError:
-    _HAS_CORE = False
-    _register = None  # type: ignore[assignment]
-
-
 def create_timeout(
     config: TimeoutConfig | None = None,
     *,
     name: str,
     register: bool = True,
 ) -> Timeout[Any, Any]:
-    """Factory function to create and optionally register a Timeout instance.
-
-    Args:
-        config: Configuration for timeout behavior.
-        name: Name for this timeout instance (required for registry).
-        register: Whether to register with pysilience core registry.
-
-    Returns:
-        A configured Timeout instance.
-    """
+    """Create a :class:`Timeout` and optionally register it with :func:`pysilience.core.register`."""
     instance: Timeout[Any, Any] = Timeout(config, name=name)
-
-    if register and _HAS_CORE and _register is not None:
-        _register("timeout", name, instance)
-
+    if register:
+        register_pattern("timeout", name, instance)
     return instance

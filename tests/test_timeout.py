@@ -365,9 +365,8 @@ class TestTimeoutClass:
         with patch(
             "pysilience.timeout.concurrent.futures.ThreadPoolExecutor",
             return_value=mock_executor,
-        ):
-            with pytest.raises(RuntimeError, match="submit failed"):
-                t.execute(lambda: "ok")
+        ), pytest.raises(RuntimeError, match="submit failed"):
+            t.execute(lambda: "ok")
 
         mock_executor.shutdown.assert_called_once()
 

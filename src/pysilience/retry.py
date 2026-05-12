@@ -1,8 +1,7 @@
 """
 Pysilience - Retry Pattern
 ==========================
-This file is self-contained and can be copied directly into your project.
-No external dependencies required (Python 3.10+ stdlib only).
+Retries failed operations with configurable backoff (stdlib only; Python 3.10+).
 
 Usage:
     from retry import retry, RetryConfig, RetriesExhausted
@@ -23,7 +22,6 @@ License: MIT
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import random
 import time
@@ -32,6 +30,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Generic, ParamSpec, TypeVar, overload
 
+from pysilience.core.listeners import notify_listeners
+from pysilience.core.registry import register as register_pattern
+
 __all__ = [
     "retry",
     "Retry",
@@ -39,6 +40,7 @@ __all__ = [
     "RetriesExhausted",
     "RetryEvent",
     "RetryEventType",
+    "create_retry",
 ]
 
 P = ParamSpec("P")
@@ -187,9 +189,7 @@ class Retry(Generic[P, R]):
         self._event_listeners.append(listener)
 
     def _emit_event(self, event: RetryEvent) -> None:
-        for listener in self._event_listeners:
-            with contextlib.suppress(Exception):
-                listener(event)
+        notify_listeners(self._event_listeners, event)
 
     def _classifies_retryable(self, exc: BaseException) -> bool:
         if self.config.abort_on and isinstance(exc, self.config.abort_on):
@@ -415,27 +415,14 @@ def retry(
     return decorator
 
 
-# ============================================================================
-# OPTIONAL: INTEGRATION WITH PYSILIENCE CORE (if available)
-# ============================================================================
-
-try:
-    from pysilience.core.registry import register as _register  # type: ignore[import-untyped]
-
-    _HAS_CORE = True
-except ImportError:
-    _HAS_CORE = False
-    _register = None
-
-
 def create_retry(
     config: RetryConfig | None = None,
     *,
     name: str,
     register: bool = True,
 ) -> Retry[Any, Any]:
-    """Create and optionally register a Retry instance."""
+    """Create a :class:`Retry` and optionally register it with :func:`pysilience.core.register`."""
     instance: Retry[Any, Any] = Retry(config, name=name)
-    if register and _HAS_CORE and _register is not None:
-        _register("retry", name, instance)
+    if register:
+        register_pattern("retry", name, instance)
     return instance

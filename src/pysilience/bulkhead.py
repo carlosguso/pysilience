@@ -1,13 +1,12 @@
 """
 Pysilience - Bulkhead Pattern
 =============================
-This file is self-contained and can be copied directly into your project.
-No external dependencies required (Python 3.10+ stdlib only).
-
 Limits concurrent executions so a failing dependency cannot exhaust all
-threads or tasks. Sync and async paths each use a separate semaphore with
-the same configured capacity; use one Bulkhead for sync-only or async-only
-workloads to enforce a single shared limit.
+threads or tasks. The sync path uses a threading semaphore; the async path
+uses a lock, counter, and :class:`asyncio.Event` (not :class:`asyncio.Condition`
+with :func:`asyncio.wait_for` on :meth:`asyncio.Condition.wait`, which can
+corrupt the lock). Use one Bulkhead for sync-only or async-only workloads
+to enforce a single shared limit.
 
 Usage:
     from bulkhead import bulkhead, BulkheadConfig, BulkheadRejected
@@ -26,7 +25,6 @@ License: MIT
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import threading
 import time
@@ -35,6 +33,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Generic, ParamSpec, TypeVar, overload
 
+from pysilience.core.listeners import notify_listeners
+from pysilience.core.registry import register as register_pattern
+
 __all__ = [
     "bulkhead",
     "Bulkhead",
@@ -42,6 +43,7 @@ __all__ = [
     "BulkheadRejected",
     "BulkheadEvent",
     "BulkheadEventType",
+    "create_bulkhead",
 ]
 
 P = ParamSpec("P")
@@ -156,17 +158,23 @@ class Bulkhead(Generic[P, R]):
         self.name = name or "bulkhead"
         self._event_listeners: list[Callable[[BulkheadEvent], None]] = []
         self._sync_sem = threading.Semaphore(self.config.max_concurrent)
-        self._async_condition = asyncio.Condition()
-        self._async_available = self.config.max_concurrent
+        # Async side: lock + counter + Event (not asyncio.Condition). Wrapping
+        # ``Condition.wait()`` in ``asyncio.wait_for()`` can cancel ``wait()`` during
+        # lock cleanup and corrupt the condition (RuntimeError: Lock is not acquired).
+        # Timed waits use ``wait_for`` only on ``Event.wait()``, which does not share
+        # that failure mode.
+        self._async_mu = asyncio.Lock()
+        self._async_n = self.config.max_concurrent
+        self._async_wake = asyncio.Event()
+        if self._async_n > 0:
+            self._async_wake.set()
 
     def on_event(self, listener: Callable[[BulkheadEvent], None]) -> None:
         """Register a listener for bulkhead events."""
         self._event_listeners.append(listener)
 
     def _emit_event(self, event: BulkheadEvent) -> None:
-        for listener in self._event_listeners:
-            with contextlib.suppress(Exception):
-                listener(event)
+        notify_listeners(self._event_listeners, event)
 
     def _reject(self) -> BulkheadRejected:
         return BulkheadRejected(
@@ -219,28 +227,32 @@ class Bulkhead(Generic[P, R]):
             self._sync_sem.release()
 
     async def _async_acquire(self) -> bool:
-        async with self._async_condition:
-            deadline = (
-                time.monotonic() + self.config.max_wait if self.config.max_wait > 0 else None
-            )
-            while self._async_available == 0:
+        """Take one async permit."""
+        deadline = time.monotonic() + self.config.max_wait if self.config.max_wait > 0 else None
+
+        while True:
+            async with self._async_mu:
+                if self._async_n > 0:
+                    self._async_n -= 1
+                    if self._async_n == 0:
+                        self._async_wake.clear()
+                    return True
                 if self.config.max_wait == 0.0:
                     return False
                 assert deadline is not None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                try:
-                    await asyncio.wait_for(self._async_condition.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    return False
-            self._async_available -= 1
-            return True
+
+            try:
+                await asyncio.wait_for(self._async_wake.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
 
     async def _async_release(self) -> None:
-        async with self._async_condition:
-            self._async_available += 1
-            self._async_condition.notify()
+        async with self._async_mu:
+            self._async_n += 1
+            self._async_wake.set()
 
     async def execute_async(self, factory: Callable[[], Awaitable[R]]) -> R:
         """Run ``factory`` (each call must return an awaitable) under an async permit."""
@@ -344,27 +356,14 @@ def bulkhead(
     return decorator
 
 
-# ============================================================================
-# OPTIONAL: INTEGRATION WITH PYSILIENCE CORE (if available)
-# ============================================================================
-
-try:
-    from pysilience.core.registry import register as _register  # type: ignore[import-untyped]
-
-    _HAS_CORE = True
-except ImportError:
-    _HAS_CORE = False
-    _register = None
-
-
 def create_bulkhead(
     config: BulkheadConfig | None = None,
     *,
     name: str,
     register: bool = True,
 ) -> Bulkhead[Any, Any]:
-    """Create and optionally register a Bulkhead instance."""
+    """Create a :class:`Bulkhead` and optionally register it with :func:`pysilience.core.register`."""
     instance: Bulkhead[Any, Any] = Bulkhead(config, name=name)
-    if register and _HAS_CORE and _register is not None:
-        _register("bulkhead", name, instance)
+    if register:
+        register_pattern("bulkhead", name, instance)
     return instance
