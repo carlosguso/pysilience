@@ -1,14 +1,19 @@
 """
 Pysilience - Rate Limiter Pattern
 =================================
-Controls the rate at which operations are executed using a token-bucket
-algorithm with periodic refills (stdlib only; Python 3.10+).
+Controls the rate at which operations are executed using configurable
+algorithms (stdlib only; Python 3.10+).
 
-The limiter tracks a fixed number of **permits** that refresh every
-``limit_refresh_period`` seconds.  When a call arrives and a permit is
-available it proceeds immediately; otherwise the caller blocks up to
-``timeout_duration`` seconds waiting for the next refill.  If no permit
-becomes available in time, :exc:`RateLimitExceeded` is raised.
+Available algorithms (see :class:`RateLimitAlgorithm`):
+
+- **TOKEN_BUCKET** *(default)*: Continuous token refill up to capacity.
+  Allows bursting from idle state.
+- **LEAKY_BUCKET**: Enforces smooth, evenly-spaced requests.  No bursting
+  even after idle periods.
+- **FIXED_WINDOW**: Counter resets at fixed period boundaries.  Simple but
+  allows 2x burst at the boundary of two adjacent windows.
+- **SLIDING_WINDOW**: Weighted blend of the current and previous fixed
+  windows, smoothing the boundary burst.
 
 Usage:
     from ratelimiter import rate_limiter, RateLimiterConfig, RateLimitExceeded
@@ -21,6 +26,16 @@ Usage:
     async def call_api_async():
         ...
 
+    # Explicit algorithm selection:
+    from ratelimiter import RateLimitAlgorithm
+
+    @rate_limiter(
+        limit_for_period=10,
+        algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+    )
+    def call_api():
+        ...
+
 License: MIT
 """
 
@@ -30,6 +45,7 @@ import asyncio
 import functools
 import threading
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -42,6 +58,7 @@ __all__ = [
     "rate_limiter",
     "RateLimiter",
     "RateLimiterConfig",
+    "RateLimitAlgorithm",
     "RateLimitExceeded",
     "RateLimiterEvent",
     "RateLimiterEventType",
@@ -90,6 +107,35 @@ class RateLimitExceeded(Exception):  # noqa: N818
 
 
 # ============================================================================
+# ALGORITHM ENUM
+# ============================================================================
+
+
+class RateLimitAlgorithm(Enum):
+    """Rate limiting algorithm to use.
+
+    Attributes:
+        TOKEN_BUCKET: Tokens refill continuously at a steady rate up to
+            ``limit_for_period``.  Allows bursting from idle state.
+        LEAKY_BUCKET: Enforces a minimum interval of
+            ``limit_refresh_period / limit_for_period`` seconds between
+            requests.  Produces smooth, evenly-spaced throughput with no
+            bursting, even after idle periods.
+        FIXED_WINDOW: A simple counter that resets every
+            ``limit_refresh_period`` seconds.  Allows up to 2x burst at
+            the boundary of two adjacent windows.
+        SLIDING_WINDOW: Blends the current window's count with a weighted
+            portion of the previous window's count, smoothing out the
+            boundary burst of the fixed-window approach.
+    """
+
+    TOKEN_BUCKET = auto()
+    LEAKY_BUCKET = auto()
+    FIXED_WINDOW = auto()
+    SLIDING_WINDOW = auto()
+
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 
@@ -105,6 +151,7 @@ class RateLimiterConfig:
         timeout_duration: Maximum time (seconds) a caller will block
             waiting for a permit.  ``0.0`` means reject immediately when
             no permit is available.
+        algorithm: Rate limiting algorithm to use.
 
     Example:
         >>> config = RateLimiterConfig(limit_for_period=10, limit_refresh_period=1.0)
@@ -112,12 +159,14 @@ class RateLimiterConfig:
         ...     limit_for_period=5,
         ...     limit_refresh_period=1.0,
         ...     timeout_duration=2.0,
+        ...     algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
         ... )
     """
 
     limit_for_period: int = 50
     limit_refresh_period: float = 0.5
     timeout_duration: float = 5.0
+    algorithm: RateLimitAlgorithm = RateLimitAlgorithm.TOKEN_BUCKET
 
     def __post_init__(self) -> None:
         if self.limit_for_period < 1:
@@ -163,6 +212,211 @@ class RateLimiterEvent:
 
 
 # ============================================================================
+# STRATEGIES (private)
+# ============================================================================
+
+
+class _RateLimitStrategy(ABC):
+    """Interface for rate-limiting algorithms.
+
+    All methods are called while the caller holds ``RateLimiter._lock``.
+    """
+
+    __slots__ = ()
+
+    @abstractmethod
+    def try_acquire(self) -> bool:
+        """Attempt to acquire one permit.  Return ``True`` on success."""
+
+    @abstractmethod
+    def seconds_until_available(self) -> float:
+        """Estimated seconds until the next permit becomes available."""
+
+    @property
+    @abstractmethod
+    def permits(self) -> int:
+        """Number of permits available right now."""
+
+
+class _TokenBucketStrategy(_RateLimitStrategy):
+    """Continuous-refill token bucket.  Allows bursting from idle state."""
+
+    __slots__ = ("_capacity", "_refill_rate", "_tokens", "_last_refill")
+
+    def __init__(self, limit: int, period: float) -> None:
+        self._capacity = limit
+        self._refill_rate = limit / period
+        self._tokens = float(limit)
+        self._last_refill = time.monotonic()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        self._tokens = min(self._capacity, self._tokens + (now - self._last_refill) * self._refill_rate)
+        self._last_refill = now
+
+    def try_acquire(self) -> bool:
+        self._refill()
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
+
+    def seconds_until_available(self) -> float:
+        self._refill()
+        if self._tokens >= 1.0:
+            return 0.0
+        return (1.0 - self._tokens) / self._refill_rate
+
+    @property
+    def permits(self) -> int:
+        self._refill()
+        return int(self._tokens)
+
+
+class _LeakyBucketStrategy(_RateLimitStrategy):
+    """Leaky bucket enforcing minimum spacing between requests.
+
+    Each request advances a virtual "next allowed" timestamp by
+    ``period / limit`` seconds.  Idle time does **not** accumulate credit,
+    so there is no bursting even after long pauses.
+    """
+
+    __slots__ = ("_interval", "_next_allowed")
+
+    def __init__(self, limit: int, period: float) -> None:
+        self._interval = period / limit
+        self._next_allowed = time.monotonic()
+
+    def try_acquire(self) -> bool:
+        now = time.monotonic()
+        if self._next_allowed <= now:
+            self._next_allowed = now + self._interval
+            return True
+        return False
+
+    def seconds_until_available(self) -> float:
+        return max(0.0, self._next_allowed - time.monotonic())
+
+    @property
+    def permits(self) -> int:
+        return 1 if time.monotonic() >= self._next_allowed else 0
+
+
+class _FixedWindowStrategy(_RateLimitStrategy):
+    """Counter that resets at fixed period boundaries."""
+
+    __slots__ = ("_limit", "_period", "_count", "_window_start")
+
+    def __init__(self, limit: int, period: float) -> None:
+        self._limit = limit
+        self._period = period
+        self._count = 0
+        self._window_start = time.monotonic()
+
+    def _maybe_advance(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._window_start
+        if elapsed >= self._period:
+            windows = int(elapsed / self._period)
+            self._window_start += windows * self._period
+            self._count = 0
+
+    def try_acquire(self) -> bool:
+        self._maybe_advance()
+        if self._count < self._limit:
+            self._count += 1
+            return True
+        return False
+
+    def seconds_until_available(self) -> float:
+        self._maybe_advance()
+        if self._count < self._limit:
+            return 0.0
+        elapsed = time.monotonic() - self._window_start
+        return max(0.0, self._period - elapsed)
+
+    @property
+    def permits(self) -> int:
+        self._maybe_advance()
+        return max(0, self._limit - self._count)
+
+
+class _SlidingWindowStrategy(_RateLimitStrategy):
+    """Weighted blend of the current and previous fixed windows.
+
+    At any point within the current window the effective count is::
+
+        prev_count * (1 - elapsed/period) + curr_count
+
+    This smooths out the 2x-burst edge case of fixed windows.
+    """
+
+    __slots__ = ("_limit", "_period", "_prev_count", "_curr_count", "_window_start")
+
+    def __init__(self, limit: int, period: float) -> None:
+        self._limit = limit
+        self._period = period
+        self._prev_count = 0
+        self._curr_count = 0
+        self._window_start = time.monotonic()
+
+    def _maybe_advance(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._window_start
+        if elapsed >= self._period:
+            windows = int(elapsed / self._period)
+            if windows == 1:
+                self._prev_count = self._curr_count
+            else:
+                self._prev_count = 0
+            self._curr_count = 0
+            self._window_start += windows * self._period
+
+    def _weighted_count(self) -> float:
+        self._maybe_advance()
+        elapsed = time.monotonic() - self._window_start
+        prev_weight = 1.0 - elapsed / self._period
+        return self._prev_count * prev_weight + self._curr_count
+
+    def try_acquire(self) -> bool:
+        if self._weighted_count() + 1.0 <= self._limit:
+            self._curr_count += 1
+            return True
+        return False
+
+    def seconds_until_available(self) -> float:
+        wc = self._weighted_count()
+        if wc + 1.0 <= self._limit:
+            return 0.0
+        elapsed = time.monotonic() - self._window_start
+        remaining = max(0.0, self._period - elapsed)
+        if self._prev_count > 0:
+            excess = wc + 1.0 - self._limit
+            decrease_rate = self._prev_count / self._period
+            return min(max(0.0, excess / decrease_rate), remaining)
+        return remaining
+
+    @property
+    def permits(self) -> int:
+        return max(0, int(self._limit - self._weighted_count()))
+
+
+def _create_strategy(config: RateLimiterConfig) -> _RateLimitStrategy:
+    """Instantiate the strategy matching ``config.algorithm``."""
+    limit = config.limit_for_period
+    period = config.limit_refresh_period
+    if config.algorithm is RateLimitAlgorithm.TOKEN_BUCKET:
+        return _TokenBucketStrategy(limit, period)
+    if config.algorithm is RateLimitAlgorithm.LEAKY_BUCKET:
+        return _LeakyBucketStrategy(limit, period)
+    if config.algorithm is RateLimitAlgorithm.FIXED_WINDOW:
+        return _FixedWindowStrategy(limit, period)
+    if config.algorithm is RateLimitAlgorithm.SLIDING_WINDOW:
+        return _SlidingWindowStrategy(limit, period)
+    raise ValueError(f"Unknown algorithm: {config.algorithm}")  # pragma: no cover
+
+
+# ============================================================================
 # IMPLEMENTATION
 # ============================================================================
 
@@ -170,9 +424,8 @@ class RateLimiterEvent:
 class RateLimiter(Generic[P, R]):
     """Rate limiter that controls how many calls are permitted per period.
 
-    Permits are replenished every ``limit_refresh_period`` seconds.  When
-    all permits are consumed the caller blocks up to ``timeout_duration``
-    waiting for the next refill cycle.
+    The algorithm used to track permits is selected via
+    :attr:`RateLimiterConfig.algorithm` (default: token bucket).
 
     Use as a decorator or call ``execute`` / ``execute_async`` with a
     callable.
@@ -192,17 +445,15 @@ class RateLimiter(Generic[P, R]):
         self.name = name or "ratelimiter"
         self._event_listeners: list[Callable[[RateLimiterEvent], None]] = []
         self._lock = threading.Lock()
-        self._permits = self.config.limit_for_period
-        self._period_start = time.monotonic()
+        self._strategy = _create_strategy(self.config)
 
     # -- public properties ---------------------------------------------------
 
     @property
     def available_permits(self) -> int:
-        """Number of permits currently available (after refreshing if needed)."""
+        """Number of permits currently available."""
         with self._lock:
-            self._maybe_refresh()
-            return self._permits
+            return self._strategy.permits
 
     # -- public API -----------------------------------------------------------
 
@@ -212,28 +463,6 @@ class RateLimiter(Generic[P, R]):
 
     def _emit_event(self, event: RateLimiterEvent) -> None:
         notify_listeners(self._event_listeners, event)
-
-    def _maybe_refresh(self) -> None:
-        """Replenish permits if the current period has elapsed.  Must hold ``_lock``."""
-        now = time.monotonic()
-        elapsed = now - self._period_start
-        if elapsed >= self.config.limit_refresh_period:
-            periods = int(elapsed / self.config.limit_refresh_period)
-            self._period_start += periods * self.config.limit_refresh_period
-            self._permits = self.config.limit_for_period
-
-    def _seconds_until_refresh(self) -> float:
-        """Seconds until the next permit refresh.  Must hold ``_lock``."""
-        elapsed = time.monotonic() - self._period_start
-        return max(0.0, self.config.limit_refresh_period - elapsed)
-
-    def _try_acquire(self) -> bool:
-        """Try to acquire one permit.  Must hold ``_lock``."""
-        self._maybe_refresh()
-        if self._permits > 0:
-            self._permits -= 1
-            return True
-        return False
 
     def _reject(self, wait_time: float) -> RateLimitExceeded:
         return RateLimitExceeded(
@@ -258,19 +487,19 @@ class RateLimiter(Generic[P, R]):
 
         while True:
             with self._lock:
-                if self._try_acquire():
+                if self._strategy.try_acquire():
                     return time.monotonic() - start
 
                 if self.config.timeout_duration == 0.0:
-                    wait_needed = self._seconds_until_refresh()
+                    wait_needed = self._strategy.seconds_until_available()
                     raise self._reject(wait_needed)
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    wait_needed = self._seconds_until_refresh()
+                    wait_needed = self._strategy.seconds_until_available()
                     raise self._reject(wait_needed)
 
-                sleep_for = min(self._seconds_until_refresh(), remaining)
+                sleep_for = min(self._strategy.seconds_until_available(), remaining)
 
             time.sleep(sleep_for)
 
@@ -281,19 +510,19 @@ class RateLimiter(Generic[P, R]):
 
         while True:
             with self._lock:
-                if self._try_acquire():
+                if self._strategy.try_acquire():
                     return time.monotonic() - start
 
                 if self.config.timeout_duration == 0.0:
-                    wait_needed = self._seconds_until_refresh()
+                    wait_needed = self._strategy.seconds_until_available()
                     raise self._reject(wait_needed)
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    wait_needed = self._seconds_until_refresh()
+                    wait_needed = self._strategy.seconds_until_available()
                     raise self._reject(wait_needed)
 
-                sleep_for = min(self._seconds_until_refresh(), remaining)
+                sleep_for = min(self._strategy.seconds_until_available(), remaining)
 
             await asyncio.sleep(sleep_for)
 
@@ -410,6 +639,7 @@ def rate_limiter(
     limit_for_period: int = 50,
     limit_refresh_period: float = 0.5,
     timeout_duration: float = 5.0,
+    algorithm: RateLimitAlgorithm = RateLimitAlgorithm.TOKEN_BUCKET,
     name: str | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -420,6 +650,7 @@ def rate_limiter(
     limit_for_period: int = 50,
     limit_refresh_period: float = 0.5,
     timeout_duration: float = 5.0,
+    algorithm: RateLimitAlgorithm = RateLimitAlgorithm.TOKEN_BUCKET,
     name: str | None = None,
 ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator to wrap a function with rate-limit protection.
@@ -430,11 +661,19 @@ def rate_limiter(
         @rate_limiter(limit_for_period=10, limit_refresh_period=1.0)
         def call_api():
             ...
+
+        @rate_limiter(
+            limit_for_period=10,
+            algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+        )
+        def call_api():
+            ...
     """
     config = RateLimiterConfig(
         limit_for_period=limit_for_period,
         limit_refresh_period=limit_refresh_period,
         timeout_duration=timeout_duration,
+        algorithm=algorithm,
     )
     instance: RateLimiter[Any, Any] = RateLimiter(config, name=name)
 

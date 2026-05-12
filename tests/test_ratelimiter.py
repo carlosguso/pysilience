@@ -13,6 +13,7 @@ import time
 import pytest
 
 from pysilience.ratelimiter import (
+    RateLimitAlgorithm,
     RateLimiter,
     RateLimiterConfig,
     RateLimiterEvent,
@@ -32,16 +33,19 @@ class TestRateLimiterConfig:
         assert config.limit_for_period == 50
         assert config.limit_refresh_period == 0.5
         assert config.timeout_duration == 5.0
+        assert config.algorithm == RateLimitAlgorithm.TOKEN_BUCKET
 
     def test_custom_values(self) -> None:
         config = RateLimiterConfig(
             limit_for_period=10,
             limit_refresh_period=1.0,
             timeout_duration=2.0,
+            algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
         )
         assert config.limit_for_period == 10
         assert config.limit_refresh_period == 1.0
         assert config.timeout_duration == 2.0
+        assert config.algorithm == RateLimitAlgorithm.SLIDING_WINDOW
 
     def test_invalid_limit_for_period(self) -> None:
         with pytest.raises(ValueError, match="limit_for_period must be >= 1"):
@@ -66,7 +70,7 @@ class TestRateLimiterConfig:
 
 
 # ============================================================================
-# SYNC RATE LIMITER TESTS
+# SYNC RATE LIMITER TESTS (default: TOKEN_BUCKET)
 # ============================================================================
 
 
@@ -258,6 +262,18 @@ class TestDecoratorSyntax:
 
     def test_decorator_with_params(self) -> None:
         @rate_limiter(limit_for_period=10, limit_refresh_period=1.0, timeout_duration=0.0)
+        def f() -> str:
+            return "ok"
+
+        assert f() == "ok"
+
+    def test_decorator_with_algorithm(self) -> None:
+        @rate_limiter(
+            limit_for_period=10,
+            limit_refresh_period=1.0,
+            timeout_duration=0.0,
+            algorithm=RateLimitAlgorithm.FIXED_WINDOW,
+        )
         def f() -> str:
             return "ok"
 
@@ -507,6 +523,443 @@ class TestEdgeCases:
             pass
 
         assert returns_none() is None
+
+
+# ============================================================================
+# ALGORITHM-SPECIFIC TESTS
+# ============================================================================
+
+
+class TestTokenBucket:
+    """Token bucket allows bursting from idle and continuous refill."""
+
+    def test_burst_from_idle(self) -> None:
+        """After being idle, multiple permits are available for burst."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.TOKEN_BUCKET,
+            ),
+        )
+        for i in range(5):
+            assert rl.execute(lambda _i=i: _i) == i
+
+    def test_continuous_refill(self) -> None:
+        """Tokens refill continuously, not all at once."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=10,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.TOKEN_BUCKET,
+            ),
+        )
+        for _ in range(10):
+            rl.execute(lambda: None)
+
+        with pytest.raises(RateLimitExceeded):
+            rl.execute(lambda: None)
+
+        time.sleep(0.15)
+        assert rl.execute(lambda: "refilled") == "refilled"
+
+    def test_available_permits_reflects_continuous_refill(self) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=10,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.TOKEN_BUCKET,
+            ),
+        )
+        for _ in range(10):
+            rl.execute(lambda: None)
+        assert rl.available_permits == 0
+        time.sleep(0.55)
+        assert rl.available_permits >= 4
+
+
+class TestLeakyBucket:
+    """Leaky bucket enforces smooth spacing with no burst."""
+
+    def test_no_burst_from_idle(self) -> None:
+        """Even after idle, only 1 request goes through immediately."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.LEAKY_BUCKET,
+            ),
+        )
+        assert rl.execute(lambda: "first") == "first"
+        with pytest.raises(RateLimitExceeded):
+            rl.execute(lambda: "second-immediate")
+
+    def test_permits_after_interval(self) -> None:
+        """A new request is allowed after the inter-request interval."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.LEAKY_BUCKET,
+            ),
+        )
+        rl.execute(lambda: None)
+        time.sleep(0.25)
+        assert rl.execute(lambda: "ok") == "ok"
+
+    def test_smooth_rate_with_wait(self) -> None:
+        """Leaky bucket waits for the next slot when timeout allows."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=10,
+                limit_refresh_period=1.0,
+                timeout_duration=1.0,
+                algorithm=RateLimitAlgorithm.LEAKY_BUCKET,
+            ),
+        )
+        rl.execute(lambda: None)
+        start = time.monotonic()
+        rl.execute(lambda: None)
+        elapsed = time.monotonic() - start
+        assert elapsed >= 0.05
+
+    def test_available_permits_max_one(self) -> None:
+        """Leaky bucket never reports more than 1 available permit."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=100,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.LEAKY_BUCKET,
+            ),
+        )
+        assert rl.available_permits <= 1
+
+    @pytest.mark.asyncio
+    async def test_async_leaky_bucket(self) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=1.0,
+                algorithm=RateLimitAlgorithm.LEAKY_BUCKET,
+            ),
+        )
+
+        async def op() -> str:
+            return "ok"
+
+        assert await rl.execute_async(op) == "ok"
+        start = time.monotonic()
+        assert await rl.execute_async(op) == "ok"
+        elapsed = time.monotonic() - start
+        assert elapsed >= 0.1
+
+
+class TestFixedWindow:
+    """Fixed window resets the counter at period boundaries."""
+
+    def test_full_burst_at_start(self) -> None:
+        """All permits are available at the start of a window."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.FIXED_WINDOW,
+            ),
+        )
+        for i in range(5):
+            assert rl.execute(lambda _i=i: _i) == i
+
+        with pytest.raises(RateLimitExceeded):
+            rl.execute(lambda: None)
+
+    def test_window_resets(self) -> None:
+        """After the period elapses, permits are fully restored."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=2,
+                limit_refresh_period=0.1,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.FIXED_WINDOW,
+            ),
+        )
+        rl.execute(lambda: None)
+        rl.execute(lambda: None)
+
+        with pytest.raises(RateLimitExceeded):
+            rl.execute(lambda: None)
+
+        time.sleep(0.15)
+        assert rl.available_permits == 2
+
+    def test_permits_count(self) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=3,
+                limit_refresh_period=10.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.FIXED_WINDOW,
+            ),
+        )
+        assert rl.available_permits == 3
+        rl.execute(lambda: None)
+        assert rl.available_permits == 2
+
+    @pytest.mark.asyncio
+    async def test_async_fixed_window(self) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=3,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.FIXED_WINDOW,
+            ),
+        )
+
+        async def op() -> int:
+            return 1
+
+        results = await asyncio.gather(
+            rl.execute_async(op),
+            rl.execute_async(op),
+            rl.execute_async(op),
+        )
+        assert results == [1, 1, 1]
+
+
+class TestSlidingWindow:
+    """Sliding window smooths the fixed-window boundary burst."""
+
+    def test_initial_burst_allowed(self) -> None:
+        """Within the first window, up to limit requests are allowed."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=3,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+            ),
+        )
+        for _ in range(3):
+            rl.execute(lambda: None)
+
+        with pytest.raises(RateLimitExceeded):
+            rl.execute(lambda: None)
+
+    def test_boundary_burst_prevented(self) -> None:
+        """Unlike fixed window, sliding window restricts the burst at
+        the window boundary.  After using all 3 permits at the end of
+        window 1, at the start of window 2 the weighted count is still
+        high, so the full limit is NOT immediately available.
+        """
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=3,
+                limit_refresh_period=0.2,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+            ),
+        )
+        for _ in range(3):
+            rl.execute(lambda: None)
+
+        time.sleep(0.22)
+        allowed = 0
+        for _ in range(3):
+            try:
+                rl.execute(lambda: None)
+                allowed += 1
+            except RateLimitExceeded:
+                break
+
+        assert allowed < 3
+
+    def test_eventually_refreshes(self) -> None:
+        """After enough time passes, permits become fully available."""
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=2,
+                limit_refresh_period=0.1,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+            ),
+        )
+        rl.execute(lambda: None)
+        rl.execute(lambda: None)
+
+        time.sleep(0.25)
+        assert rl.execute(lambda: "ok") == "ok"
+
+    def test_waits_for_permit(self) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=1,
+                limit_refresh_period=0.1,
+                timeout_duration=1.0,
+                algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+            ),
+        )
+        rl.execute(lambda: None)
+        start = time.monotonic()
+        rl.execute(lambda: None)
+        elapsed = time.monotonic() - start
+        assert elapsed >= 0.05
+
+    @pytest.mark.asyncio
+    async def test_async_sliding_window(self) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=2,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+            ),
+        )
+
+        async def op() -> str:
+            return "ok"
+
+        assert await rl.execute_async(op) == "ok"
+        assert await rl.execute_async(op) == "ok"
+
+        with pytest.raises(RateLimitExceeded):
+            await rl.execute_async(op)
+
+
+class TestAlgorithmSelection:
+    """Verify that the algorithm parameter is wired through correctly."""
+
+    @pytest.mark.parametrize("algo", list(RateLimitAlgorithm))
+    def test_each_algorithm_basic_execute(self, algo: RateLimitAlgorithm) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=algo,
+            ),
+        )
+        assert rl.execute(lambda: "ok") == "ok"
+
+    @pytest.mark.parametrize("algo", list(RateLimitAlgorithm))
+    @pytest.mark.asyncio
+    async def test_each_algorithm_async_execute(self, algo: RateLimitAlgorithm) -> None:
+        rl = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=algo,
+            ),
+        )
+
+        async def op() -> str:
+            return "ok"
+
+        assert await rl.execute_async(op) == "ok"
+
+    def test_decorator_passes_algorithm(self) -> None:
+        @rate_limiter(
+            limit_for_period=5,
+            limit_refresh_period=1.0,
+            timeout_duration=0.0,
+            algorithm=RateLimitAlgorithm.LEAKY_BUCKET,
+        )
+        def f() -> str:
+            return "ok"
+
+        assert f() == "ok"
+
+    def test_token_bucket_vs_leaky_bucket_burst_behavior(self) -> None:
+        """Token bucket allows burst; leaky bucket does not."""
+        tb = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.TOKEN_BUCKET,
+            ),
+        )
+        lb = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=5,
+                limit_refresh_period=1.0,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.LEAKY_BUCKET,
+            ),
+        )
+
+        tb_count = 0
+        for _ in range(5):
+            try:
+                tb.execute(lambda: None)
+                tb_count += 1
+            except RateLimitExceeded:
+                break
+
+        lb_count = 0
+        for _ in range(5):
+            try:
+                lb.execute(lambda: None)
+                lb_count += 1
+            except RateLimitExceeded:
+                break
+
+        assert tb_count == 5
+        assert lb_count == 1
+
+    def test_fixed_window_vs_sliding_window_boundary(self) -> None:
+        """After exhausting permits and crossing a window boundary,
+        fixed window restores full permits while sliding window does not.
+        """
+        fw = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=3,
+                limit_refresh_period=0.1,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.FIXED_WINDOW,
+            ),
+        )
+        sw = RateLimiter(
+            RateLimiterConfig(
+                limit_for_period=3,
+                limit_refresh_period=0.1,
+                timeout_duration=0.0,
+                algorithm=RateLimitAlgorithm.SLIDING_WINDOW,
+            ),
+        )
+
+        for _ in range(3):
+            fw.execute(lambda: None)
+            sw.execute(lambda: None)
+
+        time.sleep(0.12)
+
+        fw_count = 0
+        for _ in range(3):
+            try:
+                fw.execute(lambda: None)
+                fw_count += 1
+            except RateLimitExceeded:
+                break
+
+        sw_count = 0
+        for _ in range(3):
+            try:
+                sw.execute(lambda: None)
+                sw_count += 1
+            except RateLimitExceeded:
+                break
+
+        assert fw_count == 3
+        assert sw_count < 3
 
 
 # ============================================================================
