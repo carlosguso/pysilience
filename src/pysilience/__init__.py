@@ -9,8 +9,10 @@ Patterns:
     - timeout: Limits execution time of operations
     - retry: Automatically retries failed operations
     - bulkhead: Limits concurrent executions
+    - fallback: Provides alternative results on failure
+    - cache: Caches function results with LRU eviction and TTL
     - circuitbreaker: Prevents cascading failures (coming soon)
-    - ratelimiter: Limits rate of operations (coming soon)
+    - ratelimiter: Limits rate of operations
 
 Basic usage:
     >>> from pysilience import timeout
@@ -24,7 +26,7 @@ Registry and core utilities:
     >>> r = create_retry(name="api", register=True)  # doctest: +SKIP
 
 Submodules: ``pysilience.timeout``, ``pysilience.retry``, ``pysilience.bulkhead``,
-``pysilience.core``.
+``pysilience.fallback``, ``pysilience.cache``, ``pysilience.core``.
 """
 
 from pysilience._version import __version__
@@ -37,6 +39,14 @@ from pysilience.bulkhead import (
     bulkhead,
     create_bulkhead,
 )
+from pysilience.cache import (
+    Cache,
+    CacheConfig,
+    CacheEvent,
+    CacheEventType,
+    cache,
+    create_cache,
+)
 from pysilience.core import (
     clear as clear_registry,
 )
@@ -46,6 +56,24 @@ from pysilience.core import (
 from pysilience.core import (
     register,
     unregister,
+)
+from pysilience.fallback import (
+    Fallback,
+    FallbackConfig,
+    FallbackEvent,
+    FallbackEventType,
+    create_fallback,
+    fallback,
+)
+from pysilience.ratelimiter import (
+    RateLimitAlgorithm,
+    RateLimiter,
+    RateLimiterConfig,
+    RateLimiterEvent,
+    RateLimiterEventType,
+    RateLimitExceeded,
+    create_rate_limiter,
+    rate_limiter,
 )
 from pysilience.retry import (
     RetriesExhausted,
@@ -90,6 +118,15 @@ __all__ = [
     "RetryEvent",
     "RetryEventType",
     "create_retry",
+    # Rate Limiter
+    "rate_limiter",
+    "RateLimiter",
+    "RateLimiterConfig",
+    "RateLimitAlgorithm",
+    "RateLimitExceeded",
+    "RateLimiterEvent",
+    "RateLimiterEventType",
+    "create_rate_limiter",
     # Bulkhead
     "bulkhead",
     "Bulkhead",
@@ -98,4 +135,18 @@ __all__ = [
     "BulkheadEvent",
     "BulkheadEventType",
     "create_bulkhead",
+    # Fallback
+    "fallback",
+    "Fallback",
+    "FallbackConfig",
+    "FallbackEvent",
+    "FallbackEventType",
+    "create_fallback",
+    # Cache
+    "cache",
+    "Cache",
+    "CacheConfig",
+    "CacheEvent",
+    "CacheEventType",
+    "create_cache",
 ]
