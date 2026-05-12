@@ -1,0 +1,570 @@
+"""
+Tests for the Redis cache backend.
+
+All Redis I/O is mocked -- no running Redis instance is needed.
+
+Run with: pytest tests/test_cache_redis.py -v
+"""
+
+from __future__ import annotations
+
+import asyncio
+import pickle
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from pysilience.cache import (
+    _MISS,
+    Cache,
+    CacheConfig,
+    CacheEvent,
+    CacheEventType,
+)
+from pysilience.cache_redis import RedisBackend, _serialise_key
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_sync_client() -> MagicMock:
+    """Return a mock ``redis.Redis`` instance."""
+    client = MagicMock()
+    client.get.return_value = None
+    client.set.return_value = True
+    client.setex.return_value = True
+    client.delete.return_value = 0
+    client.scan.return_value = (0, [])
+    return client
+
+
+def _make_async_client() -> MagicMock:
+    """Return a mock ``redis.asyncio.Redis`` instance with async methods."""
+    client = MagicMock()
+    client.get = AsyncMock(return_value=None)
+    client.set = AsyncMock(return_value=True)
+    client.setex = AsyncMock(return_value=True)
+    client.delete = AsyncMock(return_value=0)
+    client.scan = AsyncMock(return_value=(0, []))
+    return client
+
+
+# ============================================================================
+# CONSTRUCTION
+# ============================================================================
+
+
+class TestRedisBackendConstruction:
+    def test_requires_at_least_one_client(self) -> None:
+        with pytest.raises(ValueError, match="At least one"):
+            RedisBackend()
+
+    def test_sync_only(self) -> None:
+        backend = RedisBackend(sync_client=_make_sync_client())
+        assert backend._sync is not None
+        assert backend._async is None
+
+    def test_async_only(self) -> None:
+        backend = RedisBackend(async_client=_make_async_client())
+        assert backend._sync is None
+        assert backend._async is not None
+
+    def test_both_clients(self) -> None:
+        backend = RedisBackend(
+            sync_client=_make_sync_client(),
+            async_client=_make_async_client(),
+        )
+        assert backend._sync is not None
+        assert backend._async is not None
+
+    def test_default_prefix(self) -> None:
+        backend = RedisBackend(sync_client=_make_sync_client())
+        assert backend._prefix == "pysilience:"
+
+    def test_custom_prefix(self) -> None:
+        backend = RedisBackend(sync_client=_make_sync_client(), prefix="myapp:")
+        assert backend._prefix == "myapp:"
+
+
+# ============================================================================
+# KEY SERIALISATION
+# ============================================================================
+
+
+class TestKeySerialization:
+    def test_string_key(self) -> None:
+        result = _serialise_key("hello", "pfx:")
+        assert result.startswith("pfx:")
+        assert len(result) > len("pfx:")
+
+    def test_tuple_key(self) -> None:
+        result = _serialise_key((1, "a", 2.0), "pfx:")
+        assert result.startswith("pfx:")
+
+    def test_deterministic(self) -> None:
+        a = _serialise_key(("user", 42), "p:")
+        b = _serialise_key(("user", 42), "p:")
+        assert a == b
+
+    def test_different_keys_differ(self) -> None:
+        a = _serialise_key("key_a", "p:")
+        b = _serialise_key("key_b", "p:")
+        assert a != b
+
+
+# ============================================================================
+# SYNC OPERATIONS
+# ============================================================================
+
+
+class TestSyncOperations:
+    def test_get_miss(self) -> None:
+        client = _make_sync_client()
+        client.get.return_value = None
+        backend = RedisBackend(sync_client=client)
+
+        assert backend.get("k") is _MISS
+        client.get.assert_called_once()
+
+    def test_get_hit(self) -> None:
+        client = _make_sync_client()
+        value = {"user": "alice"}
+        client.get.return_value = pickle.dumps(value, protocol=5)
+        backend = RedisBackend(sync_client=client)
+
+        result = backend.get("k")
+        assert result == value
+
+    def test_put_without_ttl(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+
+        backend.put("k", "v")
+        client.set.assert_called_once()
+        client.setex.assert_not_called()
+        raw = client.set.call_args[0][1]
+        assert pickle.loads(raw) == "v"  # noqa: S301
+
+    def test_put_with_ttl(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+
+        backend.put("k", "v", ttl=60.0)
+        client.setex.assert_called_once()
+        client.set.assert_not_called()
+        _, ttl_arg, raw = client.setex.call_args[0]
+        assert ttl_arg == 60
+        assert pickle.loads(raw) == "v"  # noqa: S301
+
+    def test_put_ttl_minimum_one_second(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+
+        backend.put("k", "v", ttl=0.1)
+        _, ttl_arg, _ = client.setex.call_args[0]
+        assert ttl_arg == 1
+
+    def test_delete_existing(self) -> None:
+        client = _make_sync_client()
+        client.delete.return_value = 1
+        backend = RedisBackend(sync_client=client)
+
+        assert backend.delete("k") is True
+
+    def test_delete_missing(self) -> None:
+        client = _make_sync_client()
+        client.delete.return_value = 0
+        backend = RedisBackend(sync_client=client)
+
+        assert backend.delete("k") is False
+
+    def test_clear_no_keys(self) -> None:
+        client = _make_sync_client()
+        client.scan.return_value = (0, [])
+        backend = RedisBackend(sync_client=client)
+
+        backend.clear()
+        client.scan.assert_called_once()
+        client.delete.assert_not_called()
+
+    def test_clear_with_keys(self) -> None:
+        client = _make_sync_client()
+        client.scan.side_effect = [
+            (42, [b"pysilience:k1", b"pysilience:k2"]),
+            (0, [b"pysilience:k3"]),
+        ]
+        backend = RedisBackend(sync_client=client)
+
+        backend.clear()
+        assert client.delete.call_count == 2
+
+    def test_sync_raises_without_client(self) -> None:
+        backend = RedisBackend(async_client=_make_async_client())
+        with pytest.raises(RuntimeError, match="Sync Redis client not available"):
+            backend.get("k")
+
+
+# ============================================================================
+# ASYNC OPERATIONS
+# ============================================================================
+
+
+class TestAsyncOperations:
+    @pytest.mark.asyncio
+    async def test_aget_miss(self) -> None:
+        client = _make_async_client()
+        client.get.return_value = None
+        backend = RedisBackend(async_client=client)
+
+        assert await backend.aget("k") is _MISS
+
+    @pytest.mark.asyncio
+    async def test_aget_hit(self) -> None:
+        client = _make_async_client()
+        value = [1, 2, 3]
+        client.get.return_value = pickle.dumps(value, protocol=5)
+        backend = RedisBackend(async_client=client)
+
+        assert await backend.aget("k") == value
+
+    @pytest.mark.asyncio
+    async def test_aput_without_ttl(self) -> None:
+        client = _make_async_client()
+        backend = RedisBackend(async_client=client)
+
+        await backend.aput("k", "v")
+        client.set.assert_awaited_once()
+        client.setex.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_aput_with_ttl(self) -> None:
+        client = _make_async_client()
+        backend = RedisBackend(async_client=client)
+
+        await backend.aput("k", "v", ttl=120.0)
+        client.setex.assert_awaited_once()
+        client.set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_adelete(self) -> None:
+        client = _make_async_client()
+        client.delete.return_value = 1
+        backend = RedisBackend(async_client=client)
+
+        assert await backend.adelete("k") is True
+
+    @pytest.mark.asyncio
+    async def test_aclear(self) -> None:
+        client = _make_async_client()
+        client.scan.side_effect = [
+            (10, [b"pysilience:a"]),
+            (0, []),
+        ]
+        backend = RedisBackend(async_client=client)
+
+        await backend.aclear()
+        assert client.scan.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_raises_without_client(self) -> None:
+        backend = RedisBackend(sync_client=_make_sync_client())
+        with pytest.raises(RuntimeError, match="Async Redis client not available"):
+            await backend.aget("k")
+
+
+# ============================================================================
+# PICKLE ROUND-TRIP
+# ============================================================================
+
+
+class TestPickleRoundTrip:
+    def test_none_value(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+
+        backend.put("k", None)
+        raw = client.set.call_args[0][1]
+        client.get.return_value = raw
+        assert backend.get("k") is None
+
+    def test_complex_value(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+
+        value: dict[str, Any] = {"nested": {"a": [1, 2.0, True, None]}}
+        backend.put("k", value)
+        raw = client.set.call_args[0][1]
+        client.get.return_value = raw
+        assert backend.get("k") == value
+
+    def test_bytes_value(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+
+        value = b"\x00\x01\xff"
+        backend.put("k", value)
+        raw = client.set.call_args[0][1]
+        client.get.return_value = raw
+        assert backend.get("k") == value
+
+
+# ============================================================================
+# PREFIX NAMESPACING
+# ============================================================================
+
+
+class TestPrefixNamespacing:
+    def test_prefix_in_key(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client, prefix="myapp:")
+
+        backend.get("k")
+        redis_key = client.get.call_args[0][0]
+        assert redis_key.startswith("myapp:")
+
+    def test_clear_uses_prefix_pattern(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client, prefix="myapp:")
+
+        backend.clear()
+        pattern = client.scan.call_args[1].get("match") or client.scan.call_args[0][1]
+        assert pattern == "myapp:*"
+
+
+# ============================================================================
+# CACHE + REDIS BACKEND INTEGRATION
+# ============================================================================
+
+
+class TestCacheWithRedisBackend:
+    """Integration tests using Cache with a mocked RedisBackend."""
+
+    def test_sync_miss_then_hit(self) -> None:
+        client = _make_sync_client()
+        stored: dict[str, bytes] = {}
+
+        def mock_set(key: str, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        def mock_setex(key: str, ttl: int, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        def mock_get(key: str) -> bytes | None:
+            return stored.get(key)
+
+        client.set.side_effect = mock_set
+        client.setex.side_effect = mock_setex
+        client.get.side_effect = mock_get
+
+        backend = RedisBackend(sync_client=client)
+        c = Cache(CacheConfig(ttl=60.0), backend=backend, name="test")
+
+        call_count = 0
+
+        def compute() -> str:
+            nonlocal call_count
+            call_count += 1
+            return "hello"
+
+        assert c.execute("k", compute) == "hello"
+        assert call_count == 1
+        assert c.execute("k", compute) == "hello"
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_miss_then_hit(self) -> None:
+        client = _make_async_client()
+        stored: dict[str, bytes] = {}
+
+        async def mock_set(key: str, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        async def mock_setex(key: str, ttl: int, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        async def mock_get(key: str) -> bytes | None:
+            return stored.get(key)
+
+        client.set = AsyncMock(side_effect=mock_set)
+        client.setex = AsyncMock(side_effect=mock_setex)
+        client.get = AsyncMock(side_effect=mock_get)
+
+        backend = RedisBackend(async_client=client)
+        c = Cache(CacheConfig(ttl=60.0), backend=backend, name="test")
+
+        call_count = 0
+
+        async def compute() -> str:
+            nonlocal call_count
+            call_count += 1
+            return "hello"
+
+        assert await c.execute_async("k", compute) == "hello"
+        assert call_count == 1
+        assert await c.execute_async("k", compute) == "hello"
+        assert call_count == 1
+
+    def test_events_emitted(self) -> None:
+        client = _make_sync_client()
+        stored: dict[str, bytes] = {}
+
+        def mock_set(key: str, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        def mock_setex(key: str, ttl: int, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        def mock_get(key: str) -> bytes | None:
+            return stored.get(key)
+
+        client.set.side_effect = mock_set
+        client.setex.side_effect = mock_setex
+        client.get.side_effect = mock_get
+
+        backend = RedisBackend(sync_client=client)
+        c = Cache(CacheConfig(ttl=60.0), backend=backend, name="ev")
+
+        events: list[CacheEvent] = []
+        c.on_event(events.append)
+
+        c.execute("k", lambda: "v")
+        c.execute("k", lambda: "v")
+
+        assert len(events) == 2
+        assert events[0].event_type == CacheEventType.MISS
+        assert events[1].event_type == CacheEventType.HIT
+
+    def test_invalidate_delegates_to_backend(self) -> None:
+        client = _make_sync_client()
+        client.delete.return_value = 1
+        backend = RedisBackend(sync_client=client)
+        c = Cache(backend=backend, name="inv")
+
+        assert c.invalidate("k") is True
+        client.delete.assert_called_once()
+
+    def test_invalidate_all_delegates_to_backend(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+        c = Cache(backend=backend, name="inv")
+
+        c.invalidate_all()
+        client.scan.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_async_thundering_herd(self) -> None:
+        """Multiple coroutines for the same key should only compute once."""
+        client = _make_async_client()
+        stored: dict[str, bytes] = {}
+
+        async def mock_set(key: str, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        async def mock_setex(key: str, ttl: int, value: bytes) -> bool:
+            stored[key] = value
+            return True
+
+        async def mock_get(key: str) -> bytes | None:
+            return stored.get(key)
+
+        client.set = AsyncMock(side_effect=mock_set)
+        client.setex = AsyncMock(side_effect=mock_setex)
+        client.get = AsyncMock(side_effect=mock_get)
+
+        backend = RedisBackend(async_client=client)
+        c = Cache(CacheConfig(ttl=60.0), backend=backend, name="herd")
+
+        compute_count = 0
+
+        async def expensive() -> int:
+            nonlocal compute_count
+            compute_count += 1
+            await asyncio.sleep(0.05)
+            return 42
+
+        results = await asyncio.gather(
+            c.execute_async("shared", expensive),
+            c.execute_async("shared", expensive),
+            c.execute_async("shared", expensive),
+            c.execute_async("shared", expensive),
+            c.execute_async("shared", expensive),
+        )
+
+        assert all(r == 42 for r in results)
+        assert compute_count == 1, f"Expected 1 computation, got {compute_count}"
+
+    def test_sync_thundering_herd(self) -> None:
+        """Multiple threads for the same key should only compute once."""
+        import threading
+
+        client = _make_sync_client()
+        stored: dict[str, bytes] = {}
+        store_lock = threading.Lock()
+
+        def mock_set(key: str, value: bytes) -> bool:
+            with store_lock:
+                stored[key] = value
+            return True
+
+        def mock_setex(key: str, ttl: int, value: bytes) -> bool:
+            with store_lock:
+                stored[key] = value
+            return True
+
+        def mock_get(key: str) -> bytes | None:
+            with store_lock:
+                return stored.get(key)
+
+        client.set.side_effect = mock_set
+        client.setex.side_effect = mock_setex
+        client.get.side_effect = mock_get
+
+        backend = RedisBackend(sync_client=client)
+        c = Cache(CacheConfig(ttl=60.0), backend=backend, name="herd")
+
+        import time
+
+        compute_count = 0
+        count_lock = threading.Lock()
+        barrier = threading.Barrier(5)
+
+        def expensive() -> int:
+            nonlocal compute_count
+            with count_lock:
+                compute_count += 1
+            time.sleep(0.05)
+            return 42
+
+        results: list[int] = []
+        results_lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait()
+            result = c.execute("shared", expensive)
+            with results_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        assert len(results) == 5
+        assert all(r == 42 for r in results)
+        assert compute_count == 1, f"Expected 1 computation, got {compute_count}"
+
+    def test_backend_property(self) -> None:
+        client = _make_sync_client()
+        backend = RedisBackend(sync_client=client)
+        c = Cache(backend=backend, name="test")
+        assert c.backend is backend

@@ -1,7 +1,7 @@
 """
 Pysilience - Retry Pattern
 ==========================
-Retries failed operations with configurable backoff (stdlib only; Python 3.10+).
+Retries failed operations with configurable backoff (Python 3.10+, stdlib only).
 
 Usage:
     from retry import retry, RetryConfig, RetriesExhausted

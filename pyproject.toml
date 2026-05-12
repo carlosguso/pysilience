@@ -32,16 +32,21 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-# IMPORTANT: No runtime dependencies - everything uses stdlib only
+# Core patterns have no runtime dependencies (stdlib only).
+# Optional extras (e.g. redis) are declared under [project.optional-dependencies].
 dependencies = []
 
 [project.optional-dependencies]
+redis = [
+    "redis>=5.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-cov>=4.0",
     "mypy>=1.8",
     "ruff>=0.8",
+    "redis>=5.0",
 ]
 
 [project.urls]
@@ -49,6 +54,9 @@ Homepage = "https://github.com/carlosguso/pysilience"
 Documentation = "https://github.com/carlosguso/pysilience#readme"
 Repository = "https://github.com/carlosguso/pysilience"
 Issues = "https://github.com/carlosguso/pysilience/issues"
+
+[tool.uv]
+exclude-newer = "7 days"
 
 [build-system]
 requires = ["hatchling"]

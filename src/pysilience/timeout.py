@@ -1,7 +1,7 @@
 """
 Pysilience - Timeout Pattern
 ============================
-Limits how long a sync or async operation may run (stdlib only; Python 3.10+).
+Limits how long a sync or async operation may run (Python 3.10+, stdlib only).
 
 Usage:
     from timeout import timeout, TimeoutConfig, OperationTimeout
