@@ -1,11 +1,12 @@
 """
 Pysilience - Cache Pattern
 ==========================
-Caches function results with configurable max size (LRU eviction) and
-optional TTL (stdlib only; Python 3.10+).
+Caches function results with pluggable storage backends.  Ships with an
+in-memory LRU backend (``MemoryBackend``) and supports external backends
+such as Redis (see ``pysilience.cache_redis``).
 
 Usage:
-    from cache import cache, CacheConfig
+    from pysilience import cache, CacheConfig
 
     @cache(max_size=128, ttl=60.0)
     def fetch_user(user_id: int) -> dict:
@@ -18,6 +19,11 @@ Usage:
     # Use ``Cache`` directly for explicit key control:
     c = Cache(CacheConfig(max_size=100, ttl=60.0), name="users")
     result = c.execute("user:42", lambda: fetch_user(42))
+
+    # Plug in a Redis backend:
+    from pysilience.cache_redis import RedisBackend
+    rb = RedisBackend(sync_client=redis_conn, prefix="app:")
+    c = Cache(CacheConfig(ttl=60.0), backend=rb, name="users")
 
 License: MIT
 """
@@ -32,7 +38,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Hashable
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Generic, ParamSpec, TypeVar, overload
+from typing import Any, Generic, ParamSpec, Protocol, TypeVar, overload, runtime_checkable
 
 from pysilience.core.listeners import notify_listeners
 from pysilience.core.registry import register as register_pattern
@@ -40,10 +46,12 @@ from pysilience.core.registry import register as register_pattern
 __all__ = [
     "cache",
     "Cache",
+    "CacheBackend",
     "CacheConfig",
     "CacheEvent",
     "CacheEventType",
     "create_cache",
+    "MemoryBackend",
 ]
 
 P = ParamSpec("P")
@@ -61,7 +69,9 @@ class CacheConfig:
 
     Attributes:
         max_size: Maximum number of entries in the cache.  When exceeded the
-            least-recently-used entry is evicted.  Must be >= 1.
+            least-recently-used entry is evicted.  Must be >= 1.  Only used
+            by :class:`MemoryBackend`; external backends manage their own
+            eviction.
         ttl: Time-to-live for cache entries in seconds.  ``None`` means entries
             never expire based on time.
 
@@ -103,7 +113,7 @@ class CacheEvent:
 
 
 # ============================================================================
-# INTERNAL
+# INTERNAL HELPERS
 # ============================================================================
 
 
@@ -114,15 +124,137 @@ class _CacheEntry:
 
 
 _MISS: Any = object()
+"""Sentinel returned by :class:`CacheBackend` methods to signal a cache miss.
+
+External backend implementations should import this sentinel and return it
+from :meth:`~CacheBackend.get` / :meth:`~CacheBackend.aget` when the
+requested key is not present.
+"""
 
 
 # ============================================================================
-# IMPLEMENTATION
+# BACKEND PROTOCOL
+# ============================================================================
+
+
+@runtime_checkable
+class CacheBackend(Protocol):
+    """Protocol that cache storage backends must satisfy.
+
+    Sync methods (``get``, ``put``, ``delete``, ``clear``) are used by
+    :meth:`Cache.execute`.  Async methods (``aget``, ``aput``, ``adelete``,
+    ``aclear``) are used by :meth:`Cache.execute_async`.
+
+    Return ``_MISS`` (importable from ``pysilience.cache``) from ``get`` /
+    ``aget`` when the key is absent so that cached ``None`` values can be
+    distinguished from true misses.
+    """
+
+    def get(self, key: Hashable) -> Any: ...
+    def put(self, key: Hashable, value: Any, ttl: float | None = None) -> None: ...
+    def delete(self, key: Hashable) -> bool: ...
+    def clear(self) -> None: ...
+    async def aget(self, key: Hashable) -> Any: ...
+    async def aput(self, key: Hashable, value: Any, ttl: float | None = None) -> None: ...
+    async def adelete(self, key: Hashable) -> bool: ...
+    async def aclear(self) -> None: ...
+
+
+# ============================================================================
+# MEMORY BACKEND (default)
+# ============================================================================
+
+
+class MemoryBackend:
+    """In-memory LRU cache backend with optional TTL.
+
+    This is the default backend created by :class:`Cache` when no explicit
+    backend is provided.  It stores entries in an :class:`~collections.OrderedDict`
+    and evicts the least-recently-used entry when ``max_size`` is exceeded.
+
+    .. note::
+        This backend is **not** independently thread-safe.  The
+        :class:`Cache` class serialises access via its own lock.
+
+    Args:
+        max_size: Maximum entries before LRU eviction.  Must be >= 1.
+        ttl: Time-to-live in seconds, or ``None`` for no expiry.
+    """
+
+    __slots__ = ("_max_size", "_ttl", "_store")
+
+    def __init__(self, max_size: int = 128, ttl: float | None = None) -> None:
+        self._max_size = max_size
+        self._ttl = ttl
+        self._store: OrderedDict[Hashable, _CacheEntry] = OrderedDict()
+
+    @property
+    def size(self) -> int:
+        """Number of entries currently stored."""
+        return len(self._store)
+
+    def _is_expired(self, entry: _CacheEntry) -> bool:
+        if self._ttl is None:
+            return False
+        return (time.monotonic() - entry.cached_at) >= self._ttl
+
+    # -- sync ----------------------------------------------------------------
+
+    def get(self, key: Hashable) -> Any:
+        """Return cached value or ``_MISS``."""
+        entry = self._store.get(key)
+        if entry is None:
+            return _MISS
+        if self._is_expired(entry):
+            del self._store[key]
+            return _MISS
+        self._store.move_to_end(key)
+        return entry.value
+
+    def put(self, key: Hashable, value: Any, ttl: float | None = None) -> None:
+        """Store *value* under *key*, evicting LRU entries as needed."""
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._store[key] = _CacheEntry(value=value, cached_at=time.monotonic())
+        else:
+            while len(self._store) >= self._max_size:
+                self._store.popitem(last=False)
+            self._store[key] = _CacheEntry(value=value, cached_at=time.monotonic())
+
+    def delete(self, key: Hashable) -> bool:
+        """Remove *key*.  Returns ``True`` if it existed."""
+        try:
+            del self._store[key]
+        except KeyError:
+            return False
+        return True
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        self._store.clear()
+
+    # -- async (delegates to sync; no I/O) -----------------------------------
+
+    async def aget(self, key: Hashable) -> Any:
+        return self.get(key)
+
+    async def aput(self, key: Hashable, value: Any, ttl: float | None = None) -> None:
+        self.put(key, value, ttl)
+
+    async def adelete(self, key: Hashable) -> bool:
+        return self.delete(key)
+
+    async def aclear(self) -> None:
+        self.clear()
+
+
+# ============================================================================
+# CACHE IMPLEMENTATION
 # ============================================================================
 
 
 class Cache(Generic[P, R]):
-    """Cache function results with LRU eviction and optional TTL.
+    """Cache function results with pluggable storage backends.
 
     Use as a decorator (keys are derived from arguments automatically) or call
     ``execute`` / ``execute_async`` with an explicit key and callable.
@@ -130,6 +262,12 @@ class Cache(Generic[P, R]):
     Concurrent callers requesting the same key are coalesced: only one
     invocation of the underlying function runs while the others wait for
     its result (thundering-herd protection).
+
+    Args:
+        config: Cache configuration.  Defaults to ``CacheConfig()``.
+        name: Human-readable name for event reporting.
+        backend: Storage backend.  When ``None`` a :class:`MemoryBackend` is
+            created using ``config.max_size`` and ``config.ttl``.
 
     Example:
         >>> c = Cache(CacheConfig(max_size=100, ttl=60.0), name="users")
@@ -141,21 +279,38 @@ class Cache(Generic[P, R]):
         config: CacheConfig | None = None,
         *,
         name: str | None = None,
+        backend: CacheBackend | None = None,
     ) -> None:
         self.config = config or CacheConfig()
         self.name = name or "cache"
+        if backend is None:
+            self._backend: CacheBackend = MemoryBackend(
+                max_size=self.config.max_size,
+                ttl=self.config.ttl,
+            )
+        else:
+            self._backend = backend
+        self._is_memory = isinstance(self._backend, MemoryBackend)
         self._event_listeners: list[Callable[[CacheEvent], None]] = []
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
-        self._store: OrderedDict[Hashable, _CacheEntry] = OrderedDict()
         self._inflight: set[Hashable] = set()
         self._async_inflight: dict[Hashable, asyncio.Event] = {}
 
     @property
+    def backend(self) -> CacheBackend:
+        """The storage backend in use."""
+        return self._backend
+
+    @property
     def size(self) -> int:
-        """Current number of entries in the cache."""
+        """Current number of entries in the cache.
+
+        Only supported when the backend exposes a ``size`` attribute
+        (e.g. :class:`MemoryBackend`).
+        """
         with self._lock:
-            return len(self._store)
+            return self._backend.size  # type: ignore[union-attr]
 
     def on_event(self, listener: Callable[[CacheEvent], None]) -> None:
         """Register a listener for cache events."""
@@ -163,34 +318,6 @@ class Cache(Generic[P, R]):
 
     def _emit_event(self, event: CacheEvent) -> None:
         notify_listeners(self._event_listeners, event)
-
-    def _is_expired(self, entry: _CacheEntry) -> bool:
-        if self.config.ttl is None:
-            return False
-        return (time.monotonic() - entry.cached_at) >= self.config.ttl
-
-    # -- lock-internal helpers (caller must hold ``_lock``) ------------------
-
-    def _lookup(self, key: Hashable) -> _CacheEntry | None:
-        """Return cached entry for *key* or ``None``.  Caller must hold ``_lock``."""
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        if self._is_expired(entry):
-            del self._store[key]
-            return None
-        self._store.move_to_end(key)
-        return entry
-
-    def _insert(self, key: Hashable, value: Any) -> None:
-        """Store *value* under *key* with LRU eviction.  Caller must hold ``_lock``."""
-        if key in self._store:
-            self._store.move_to_end(key)
-            self._store[key] = _CacheEntry(value=value, cached_at=time.monotonic())
-        else:
-            while len(self._store) >= self.config.max_size:
-                self._store.popitem(last=False)
-            self._store[key] = _CacheEntry(value=value, cached_at=time.monotonic())
 
     # -- sync coordination ---------------------------------------------------
 
@@ -202,9 +329,9 @@ class Cache(Generic[P, R]):
         """
         with self._condition:
             while True:
-                entry = self._lookup(key)
-                if entry is not None:
-                    return entry.value
+                value = self._backend.get(key)
+                if value is not _MISS:
+                    return value
                 if key not in self._inflight:
                     self._inflight.add(key)
                     return _MISS
@@ -219,7 +346,7 @@ class Cache(Generic[P, R]):
     def _sync_store_and_unreserve(self, key: Hashable, value: Any) -> None:
         """Cache *value*, remove *key* from in-flight, and wake waiters."""
         with self._condition:
-            self._insert(key, value)
+            self._backend.put(key, value, ttl=self.config.ttl)
             self._inflight.discard(key)
             self._condition.notify_all()
 
@@ -228,19 +355,35 @@ class Cache(Generic[P, R]):
     async def _async_check_or_reserve(self, key: Hashable) -> Any:
         """Async counterpart of :meth:`_sync_check_or_reserve`.
 
-        Uses per-key :class:`asyncio.Event` objects so waiting coroutines
-        yield to the event loop instead of blocking a thread.
+        For :class:`MemoryBackend` (no I/O) the sync ``get`` is called under
+        ``self._lock`` for thread safety.  For I/O backends the async ``aget``
+        is called outside the lock to avoid blocking the event loop.
         """
-        while True:
-            with self._lock:
-                entry = self._lookup(key)
-                if entry is not None:
-                    return entry.value
-                if key not in self._async_inflight:
-                    self._async_inflight[key] = asyncio.Event()
-                    return _MISS
-                event = self._async_inflight[key]
-            await event.wait()
+        if self._is_memory:
+            while True:
+                with self._lock:
+                    value = self._backend.get(key)
+                    if value is not _MISS:
+                        return value
+                    if key not in self._async_inflight:
+                        self._async_inflight[key] = asyncio.Event()
+                        return _MISS
+                    event = self._async_inflight[key]
+                await event.wait()
+        else:
+            value = await self._backend.aget(key)
+            if value is not _MISS:
+                return value
+            while True:
+                with self._lock:
+                    if key not in self._async_inflight:
+                        self._async_inflight[key] = asyncio.Event()
+                        return _MISS
+                    event = self._async_inflight[key]
+                await event.wait()
+                value = await self._backend.aget(key)
+                if value is not _MISS:
+                    return value
 
     def _async_unreserve(self, key: Hashable) -> None:
         """Remove *key* from async in-flight and wake waiting coroutines."""
@@ -249,11 +392,21 @@ class Cache(Generic[P, R]):
         if event is not None:
             event.set()
 
-    def _async_store_and_unreserve(self, key: Hashable, value: Any) -> None:
-        """Cache *value*, remove *key* from async in-flight, and wake waiters."""
-        with self._lock:
-            self._insert(key, value)
-            event = self._async_inflight.pop(key, None)
+    async def _async_store_and_unreserve(self, key: Hashable, value: Any) -> None:
+        """Cache *value*, remove *key* from async in-flight, and wake waiters.
+
+        For :class:`MemoryBackend` the sync ``put`` is called under the lock.
+        For I/O backends the async ``aput`` is awaited outside the lock to keep
+        the event loop responsive.
+        """
+        if self._is_memory:
+            with self._lock:
+                self._backend.put(key, value, ttl=self.config.ttl)
+                event = self._async_inflight.pop(key, None)
+        else:
+            await self._backend.aput(key, value, ttl=self.config.ttl)
+            with self._lock:
+                event = self._async_inflight.pop(key, None)
         if event is not None:
             event.set()
 
@@ -317,7 +470,7 @@ class Cache(Generic[P, R]):
                 )
             )
             raise
-        self._async_store_and_unreserve(key, result)
+        await self._async_store_and_unreserve(key, result)
         self._emit_event(
             CacheEvent(event_type=CacheEventType.MISS, name=self.name, key=key)
         )
@@ -326,16 +479,12 @@ class Cache(Generic[P, R]):
     def invalidate(self, key: Hashable) -> bool:
         """Remove *key* from the cache.  Returns ``True`` if the key existed."""
         with self._lock:
-            try:
-                del self._store[key]
-            except KeyError:
-                return False
-            return True
+            return self._backend.delete(key)
 
     def invalidate_all(self) -> None:
         """Remove all entries from the cache."""
         with self._lock:
-            self._store.clear()
+            self._backend.clear()
 
     def __call__(self, func: Callable[P, R]) -> Callable[P, R]:
         """Use Cache as a decorator.  Keys are derived from function arguments.
@@ -377,6 +526,7 @@ def cache(
     max_size: int = 128,
     ttl: float | None = None,
     name: str | None = None,
+    backend: CacheBackend | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
 
@@ -386,6 +536,7 @@ def cache(
     max_size: int = 128,
     ttl: float | None = None,
     name: str | None = None,
+    backend: CacheBackend | None = None,
 ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator to cache function results with LRU eviction and optional TTL.
 
@@ -398,7 +549,7 @@ def cache(
     Arguments to the decorated function must be hashable (used as cache key).
     """
     config = CacheConfig(max_size=max_size, ttl=ttl)
-    instance: Cache[Any, Any] = Cache(config, name=name)
+    instance: Cache[Any, Any] = Cache(config, name=name, backend=backend)
 
     def decorator(fn: Callable[P, R]) -> Callable[P, R]:
         return instance(fn)
@@ -425,9 +576,10 @@ def create_cache(
     *,
     name: str,
     register: bool = True,
+    backend: CacheBackend | None = None,
 ) -> Cache[Any, Any]:
     """Create a :class:`Cache` and optionally register it with :func:`pysilience.core.register`."""
-    instance: Cache[Any, Any] = Cache(config, name=name)
+    instance: Cache[Any, Any] = Cache(config, name=name, backend=backend)
     if register:
         register_pattern("cache", name, instance)
     return instance

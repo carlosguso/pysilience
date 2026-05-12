@@ -41,9 +41,11 @@ from pysilience.bulkhead import (
 )
 from pysilience.cache import (
     Cache,
+    CacheBackend,
     CacheConfig,
     CacheEvent,
     CacheEventType,
+    MemoryBackend,
     cache,
     create_cache,
 )
@@ -145,8 +147,10 @@ __all__ = [
     # Cache
     "cache",
     "Cache",
+    "CacheBackend",
     "CacheConfig",
     "CacheEvent",
     "CacheEventType",
+    "MemoryBackend",
     "create_cache",
 ]
