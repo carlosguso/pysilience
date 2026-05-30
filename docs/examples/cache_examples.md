@@ -41,6 +41,8 @@ def invalidate_user(user_id: int):
 
 ### Redis backend for distributed caching
 
+The default `JsonSerializer` is a good fit for dict/list API and database responses — no extra setup required.
+
 ```python
 import redis
 from pysilience import Cache, CacheConfig
@@ -53,6 +55,71 @@ user_cache = Cache(CacheConfig(ttl=300), backend=backend, name="users")
 
 def get_user(user_id: int) -> dict:
     return user_cache.execute(f"user:{user_id}", lambda: db.get_user(user_id))
+```
+
+### Redis with datetime values (JsonSerializer)
+
+`JsonSerializer` handles `datetime`, `date`, `time`, and `bytes` out of the box:
+
+```python
+from datetime import datetime
+
+import redis
+from pysilience import Cache, CacheConfig
+from pysilience.cache_redis import RedisBackend
+
+backend = RedisBackend(sync_client=redis.Redis(), prefix="myapp:events:")
+event_cache = Cache(CacheConfig(ttl=600), backend=backend, name="events")
+
+def get_event(event_id: str) -> dict:
+    return event_cache.execute(
+        f"event:{event_id}",
+        lambda: {"id": event_id, "created_at": datetime.utcnow(), "payload": {...}},
+    )
+```
+
+### Redis with arbitrary Python objects (HmacPickleSerializer)
+
+When you need to cache custom classes or other non-JSON types, use `HmacPickleSerializer`. It signs pickle payloads with HMAC-SHA256 so a compromised Redis server cannot inject malicious pickle data.
+
+```python
+import os
+import redis
+from pysilience import Cache, CacheConfig
+from pysilience.cache_redis import RedisBackend
+from pysilience.cache_serializer_hmac import HmacPickleSerializer
+
+# Pass secret explicitly, or set PYSILIENCE_CACHE_SECRET in the environment
+serializer = HmacPickleSerializer(secret=os.environ["PYSILIENCE_CACHE_SECRET"])
+backend = RedisBackend(sync_client=redis.Redis(), prefix="myapp:models:", serializer=serializer)
+
+model_cache = Cache(CacheConfig(ttl=300), backend=backend, name="models")
+
+def get_profile(user_id: int) -> UserProfile:
+    return model_cache.execute(
+        f"profile:{user_id}",
+        lambda: UserProfile.load_from_db(user_id),
+    )
+```
+
+### Redis with MessagePack (compact binary)
+
+Requires `pip install pysilience[msgpack]`. Register custom types as msgpack extension types; optional helpers for datetime types are in `cache_serializer_msgpack_builtins`.
+
+```python
+from datetime import datetime
+
+import redis
+from pysilience import Cache, CacheConfig
+from pysilience.cache_redis import RedisBackend
+from pysilience.cache_serializer_msgpack import MsgpackSerializer
+from pysilience.cache_serializer_msgpack_builtins import pack_datetime, unpack_datetime
+
+serializer = MsgpackSerializer()
+serializer.register_type(datetime, type_id=64, pack=pack_datetime, unpack=unpack_datetime)
+
+backend = RedisBackend(sync_client=redis.Redis(), prefix="myapp:metrics:", serializer=serializer)
+metrics_cache = Cache(CacheConfig(ttl=60), backend=backend, name="metrics")
 ```
 
 ### Async Redis backend
