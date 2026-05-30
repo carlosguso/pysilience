@@ -9,13 +9,15 @@ License: MIT
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import json
 import os
 import pickle
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["CacheSerializer", "HmacPickleSerializer"]
+__all__ = ["CacheSerializer", "HmacPickleSerializer", "JsonSerializer"]
 
 # SHA-256 produces a 32-byte digest; we prepend it to every stored value.
 _HMAC_DIGEST_SIZE = 32
@@ -48,6 +50,47 @@ class CacheSerializer(Protocol):
     def loads(self, raw: bytes) -> Any:
         """Deserialize *raw* bytes back to a Python object."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# JSON
+# ---------------------------------------------------------------------------
+
+_BYTES_TAG = "__pysilience_bytes__"
+
+
+class JsonSerializer(CacheSerializer):
+    """JSON serialisation for cache values.
+
+    Supports standard JSON types (``dict``, ``list``, ``str``, ``int``,
+    ``float``, ``bool``, ``None``).  :class:`bytes` values are encoded as
+    base64-wrapped objects and restored transparently on load.
+    """
+
+    __slots__ = ()
+
+    def dumps(self, value: Any) -> bytes:
+        """Serialize *value* to UTF-8 JSON bytes."""
+        return json.dumps(value, default=self._encode, separators=(",", ":")).encode()
+
+    def loads(self, raw: bytes) -> Any:
+        """Deserialize UTF-8 JSON bytes back to a Python object."""
+        try:
+            return json.loads(raw.decode(), object_hook=self._decode)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(str(exc)) from exc
+
+    @staticmethod
+    def _encode(obj: Any) -> Any:
+        if isinstance(obj, bytes):
+            return {_BYTES_TAG: base64.b64encode(obj).decode("ascii")}
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    @staticmethod
+    def _decode(obj: dict[str, Any]) -> Any:
+        if set(obj) == {_BYTES_TAG} and isinstance(obj[_BYTES_TAG], str):
+            return base64.b64decode(obj[_BYTES_TAG])
+        return obj
 
 
 # ---------------------------------------------------------------------------
