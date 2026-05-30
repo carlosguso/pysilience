@@ -9,7 +9,10 @@ Run with: pytest tests/test_cache_redis.py -v
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import pickle
+from datetime import date, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,6 +26,23 @@ from pysilience.cache import (
     CacheEventType,
 )
 from pysilience.cache_redis import RedisBackend, _serialise_key
+from pysilience.cache_serializer import CacheSerializer
+from pysilience.cache_serializer_hmac import HmacPickleSerializer, _sign
+from pysilience.cache_serializer_json import JsonSerializer
+
+# ---------------------------------------------------------------------------
+# Shared serializers
+# ---------------------------------------------------------------------------
+
+_SECRET = b"test-secret-key-for-unit-tests"
+_JSON = JsonSerializer()
+_HMAC = HmacPickleSerializer(secret=_SECRET)
+
+
+def _encoded(value: Any) -> bytes:
+    """Helper: serialize *value* as the default JSON backend would."""
+    return _JSON.dumps(value)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,6 +80,40 @@ class TestRedisBackendConstruction:
     def test_requires_at_least_one_client(self) -> None:
         with pytest.raises(ValueError, match="At least one"):
             RedisBackend()
+
+    def test_default_serializer_is_json(self) -> None:
+        backend = RedisBackend(sync_client=_make_sync_client())
+        assert isinstance(backend._serializer, JsonSerializer)
+
+    def test_explicit_serializer(self) -> None:
+        serializer = HmacPickleSerializer(secret=b"custom")
+        backend = RedisBackend(sync_client=_make_sync_client(), serializer=serializer)
+        assert backend._serializer is serializer
+
+    def test_custom_serializer(self) -> None:
+        """Users can plug in their own CacheSerializer implementation."""
+
+        class PlainTextSerializer:
+            def dumps(self, value: Any) -> bytes:
+                return str(value).encode()
+
+            def loads(self, raw: bytes) -> Any:
+                return raw.decode()
+
+        client = _make_sync_client()
+        serializer = PlainTextSerializer()
+        backend = RedisBackend(sync_client=client, serializer=serializer)
+
+        backend.put("k", "hello")
+        raw = client.set.call_args[0][1]
+        assert raw == b"hello"
+
+        client.get.return_value = raw
+        assert backend.get("k") == "hello"
+
+    def test_invalid_serializer_rejected(self) -> None:
+        with pytest.raises(TypeError, match="CacheSerializer"):
+            RedisBackend(sync_client=_make_sync_client(), serializer=object())  # type: ignore[arg-type]
 
     def test_sync_only(self) -> None:
         backend = RedisBackend(sync_client=_make_sync_client())
@@ -113,6 +167,159 @@ class TestKeySerialization:
         b = _serialise_key("key_b", "p:")
         assert a != b
 
+    def test_fixed_length_hash_suffix(self) -> None:
+        """The suffix is always a 64-char hex SHA-256 digest."""
+        result = _serialise_key(("user", 42), "pfx:")
+        suffix = result[len("pfx:"):]
+        assert len(suffix) == 64
+        int(suffix, 16)  # must be valid hex
+
+
+# ============================================================================
+# JSON SERIALIZER
+# ============================================================================
+
+
+class TestJsonSerializer:
+    def test_implements_cache_serializer_protocol(self) -> None:
+        assert isinstance(JsonSerializer(), CacheSerializer)
+
+    def test_round_trip(self) -> None:
+        value = {"hello": "world", "n": 42, "ok": True, "empty": None}
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_primitives_have_no_envelope(self) -> None:
+        raw = _JSON.dumps({"a": 1, "b": [True, None]})
+        assert b"__pysilience_type__" not in raw
+
+    def test_datetime_round_trip(self) -> None:
+        value = datetime(2025, 6, 15, 14, 30, 0)
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_date_round_trip(self) -> None:
+        value = date(2025, 6, 15)
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_nested_datetime_in_dict(self) -> None:
+        ts = datetime(2025, 1, 1, 12, 0, 0)
+        value = {"user": "alice", "created_at": ts}
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_custom_type_registration(self) -> None:
+        class UserProfile:
+            __slots__ = ("name",)
+
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def __eq__(self, other: object) -> bool:
+                return isinstance(other, UserProfile) and self.name == other.name
+
+        JsonSerializer.register(
+            UserProfile,
+            encode=lambda u: {"name": u.name},
+            decode=lambda d: UserProfile(d["name"]),
+        )
+        try:
+            profile = UserProfile("alice")
+            assert _JSON.loads(_JSON.dumps(profile)) == profile
+        finally:
+            JsonSerializer.unregister(UserProfile)
+
+    def test_override_builtin_datetime(self) -> None:
+        """Built-in handlers can be replaced via register()."""
+        original = _JSON.loads(_JSON.dumps(datetime(2025, 1, 1, 12, 0, 0)))
+
+        JsonSerializer.register(
+            datetime,
+            encode=lambda d: d.timestamp(),
+            decode=lambda ts: datetime.fromtimestamp(ts),
+        )
+        try:
+            value = datetime(2025, 6, 15, 14, 30, 0)
+            raw = _JSON.dumps(value)
+            assert b"__pysilience_ver__" not in raw
+            assert _JSON.loads(raw) == value
+        finally:
+            JsonSerializer.register(
+                datetime,
+                encode=lambda d: d.isoformat(),
+                decode=lambda s: datetime.fromisoformat(s),
+            )
+
+        assert _JSON.loads(_JSON.dumps(original)) == original
+
+    def test_unknown_envelope_raises(self) -> None:
+        payload = json.dumps(
+            {
+                "__pysilience_type__": "myapp.models.UserProfile",
+                "data": {"name": "alice"},
+            }
+        ).encode()
+        with pytest.raises(ValueError, match="Unknown pysilience type"):
+            _JSON.loads(payload)
+
+    def test_bytes_round_trip(self) -> None:
+        value = b"\x00\x01\xff"
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_invalid_json_raises(self) -> None:
+        with pytest.raises(ValueError):
+            _JSON.loads(b"not-json")
+
+
+# ============================================================================
+# HMAC PICKLE SERIALIZER
+# ============================================================================
+
+
+class TestHmacPickleSerializer:
+    def test_implements_cache_serializer_protocol(self) -> None:
+        assert isinstance(HmacPickleSerializer(secret=_SECRET), CacheSerializer)
+
+    def test_requires_secret(self) -> None:
+        env_backup = os.environ.pop("PYSILIENCE_CACHE_SECRET", None)
+        try:
+            with pytest.raises(ValueError, match="signing secret"):
+                HmacPickleSerializer()
+        finally:
+            if env_backup is not None:
+                os.environ["PYSILIENCE_CACHE_SECRET"] = env_backup
+
+    def test_sign_then_verify(self) -> None:
+        value = {"hello": "world", "n": 42}
+        signed = _HMAC.dumps(value)
+        assert signed[32:] == pickle.dumps(value, protocol=5)
+        assert _HMAC.loads(signed) == value
+
+    def test_tampered_payload_raises(self) -> None:
+        signed = _HMAC.dumps({"x": 1})
+        tampered = signed[:32] + b"\xff" + signed[33:]
+        with pytest.raises(ValueError, match="signature mismatch"):
+            _HMAC.loads(tampered)
+
+    def test_wrong_secret_raises(self) -> None:
+        signed = _HMAC.dumps(42)
+        other = HmacPickleSerializer(secret=b"wrong-secret")
+        with pytest.raises(ValueError, match="signature mismatch"):
+            other.loads(signed)
+
+    def test_too_short_raises(self) -> None:
+        with pytest.raises(ValueError, match="too short"):
+            _HMAC.loads(b"short")
+
+    def test_unsigned_pickle_raises(self) -> None:
+        """Raw unsigned pickle data (legacy) raises ValueError, not a security bypass."""
+        raw_pickle = pickle.dumps({"key": "val"}, protocol=5)
+        with pytest.raises(ValueError):
+            _HMAC.loads(raw_pickle)
+
+    def test_corrupt_pickle_payload_raises_value_error(self) -> None:
+        """Valid HMAC over invalid pickle bytes raises ValueError, not UnpicklingError."""
+        signed = _sign(b"not-valid-pickle", _SECRET)
+        with pytest.raises(ValueError, match="invalid load key"):
+            _HMAC.loads(signed)
+
 
 # ============================================================================
 # SYNC OPERATIONS
@@ -131,11 +338,52 @@ class TestSyncOperations:
     def test_get_hit(self) -> None:
         client = _make_sync_client()
         value = {"user": "alice"}
-        client.get.return_value = pickle.dumps(value, protocol=5)
+        client.get.return_value = _encoded(value)
         backend = RedisBackend(sync_client=client)
 
         result = backend.get("k")
         assert result == value
+
+    def test_get_invalid_json_returns_miss(self) -> None:
+        """Corrupt JSON is discarded as a cache miss."""
+        client = _make_sync_client()
+        client.get.return_value = b"not-valid-json"
+        backend = RedisBackend(sync_client=client)
+
+        assert backend.get("k") is _MISS
+
+    def test_get_hmac_tampered_returns_miss(self) -> None:
+        """Tampered HMAC entries are discarded as a cache miss."""
+        client = _make_sync_client()
+        client.get.return_value = b"\xff" * 32 + pickle.dumps({"evil": True})
+        backend = RedisBackend(
+            sync_client=client,
+            serializer=HmacPickleSerializer(secret=_SECRET),
+        )
+
+        assert backend.get("k") is _MISS
+
+    def test_get_hmac_unsigned_legacy_returns_miss(self) -> None:
+        """Unsigned legacy pickle data is discarded as a miss."""
+        client = _make_sync_client()
+        client.get.return_value = pickle.dumps("old_value", protocol=5)
+        backend = RedisBackend(
+            sync_client=client,
+            serializer=HmacPickleSerializer(secret=_SECRET),
+        )
+
+        assert backend.get("k") is _MISS
+
+    def test_get_hmac_corrupt_pickle_returns_miss(self) -> None:
+        """Valid HMAC over corrupt pickle is discarded as a cache miss."""
+        client = _make_sync_client()
+        client.get.return_value = _sign(b"not-valid-pickle", _SECRET)
+        backend = RedisBackend(
+            sync_client=client,
+            serializer=HmacPickleSerializer(secret=_SECRET),
+        )
+
+        assert backend.get("k") is _MISS
 
     def test_put_without_ttl(self) -> None:
         client = _make_sync_client()
@@ -145,7 +393,8 @@ class TestSyncOperations:
         client.set.assert_called_once()
         client.setex.assert_not_called()
         raw = client.set.call_args[0][1]
-        assert pickle.loads(raw) == "v"  # noqa: S301
+        # Raw bytes are JSON-encoded; verify round-trip
+        assert _JSON.loads(raw) == "v"
 
     def test_put_with_ttl(self) -> None:
         client = _make_sync_client()
@@ -156,7 +405,7 @@ class TestSyncOperations:
         client.set.assert_not_called()
         _, ttl_arg, raw = client.setex.call_args[0]
         assert ttl_arg == 60
-        assert pickle.loads(raw) == "v"  # noqa: S301
+        assert _JSON.loads(raw) == "v"
 
     def test_put_ttl_minimum_one_second(self) -> None:
         client = _make_sync_client()
@@ -224,10 +473,28 @@ class TestAsyncOperations:
     async def test_aget_hit(self) -> None:
         client = _make_async_client()
         value = [1, 2, 3]
-        client.get.return_value = pickle.dumps(value, protocol=5)
+        client.get.return_value = _encoded(value)
         backend = RedisBackend(async_client=client)
 
         assert await backend.aget("k") == value
+
+    async def test_aget_invalid_json_returns_miss(self) -> None:
+        client = _make_async_client()
+        client.get.return_value = b"{bad json"
+        backend = RedisBackend(async_client=client)
+
+        assert await backend.aget("k") is _MISS
+
+    @pytest.mark.asyncio
+    async def test_aget_hmac_tampered_returns_miss(self) -> None:
+        client = _make_async_client()
+        client.get.return_value = b"\x00" * 32 + pickle.dumps("evil")
+        backend = RedisBackend(
+            async_client=client,
+            serializer=HmacPickleSerializer(secret=_SECRET),
+        )
+
+        assert await backend.aget("k") is _MISS
 
     @pytest.mark.asyncio
     async def test_aput_without_ttl(self) -> None:
@@ -275,11 +542,11 @@ class TestAsyncOperations:
 
 
 # ============================================================================
-# PICKLE ROUND-TRIP
+# VALUE ROUND-TRIP
 # ============================================================================
 
 
-class TestPickleRoundTrip:
+class TestValueRoundTrip:
     def test_none_value(self) -> None:
         client = _make_sync_client()
         backend = RedisBackend(sync_client=client)
