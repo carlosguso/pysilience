@@ -11,7 +11,7 @@ Usage::
     import redis
     from pysilience import Cache, CacheConfig
     from pysilience.cache_redis import RedisBackend
-    from pysilience.cache_serializer import HmacPickleSerializer
+    from pysilience.cache_serializer_hmac import HmacPickleSerializer
 
     # Default: JSON (safe for untrusted Redis data)
     backend = RedisBackend(sync_client=redis.Redis())
@@ -22,12 +22,16 @@ Usage::
     serializer = HmacPickleSerializer(secret=b"my-secret-key")
     backend = RedisBackend(sync_client=redis.Redis(), serializer=serializer)
 
-    # Custom serializer
-    class MsgPackSerializer:
-        def dumps(self, value): return msgpack.packb(value)
-        def loads(self, raw): return msgpack.unpackb(raw)
+    # MessagePack (compact binary; pip install pysilience[msgpack])
+    from pysilience.cache_serializer_msgpack import MsgpackSerializer
+    backend = RedisBackend(sync_client=redis.Redis(), serializer=MsgpackSerializer())
 
-    backend = RedisBackend(sync_client=redis.Redis(), serializer=MsgPackSerializer())
+    # Custom serializer
+    class PlainSerializer:
+        def dumps(self, value): return str(value).encode()
+        def loads(self, raw): return raw.decode()
+
+    backend = RedisBackend(sync_client=redis.Redis(), serializer=PlainSerializer())
 
     # Async-only
     import redis.asyncio as aioredis
@@ -36,10 +40,10 @@ Usage::
 
 Security note
 -------------
-The default :class:`~pysilience.cache_serializer.JsonSerializer` uses
+The default :class:`~pysilience.cache_serializer_json.JsonSerializer` uses
 :mod:`json`, which is safe to deserialize from an untrusted Redis server.
 For arbitrary Python objects, use
-:class:`~pysilience.cache_serializer.HmacPickleSerializer` instead — it
+:class:`~pysilience.cache_serializer_hmac.HmacPickleSerializer` instead — it
 signs pickle payloads with HMAC-SHA256 so tampered data is rejected before
 unpickling.
 
@@ -69,7 +73,9 @@ except ImportError as _import_err:
     ) from _import_err
 
 from pysilience.cache import _MISS
-from pysilience.cache_serializer import CacheSerializer, HmacPickleSerializer, JsonSerializer
+from pysilience.cache_serializer import CacheSerializer
+from pysilience.cache_serializer_hmac import HmacPickleSerializer
+from pysilience.cache_serializer_json import JsonSerializer
 
 __all__ = ["RedisBackend", "CacheSerializer", "HmacPickleSerializer", "JsonSerializer"]
 
@@ -112,13 +118,13 @@ class RedisBackend:
         prefix: Key prefix for namespacing within the Redis database.
         serializer: A :class:`~pysilience.cache_serializer.CacheSerializer` used to
             encode and decode stored values.  Defaults to
-            :class:`~pysilience.cache_serializer.JsonSerializer`.
+            :class:`~pysilience.cache_serializer_json.JsonSerializer`.
 
     Notes:
         * By default, values are serialised as JSON.  Invalid entries are logged
           as a warning and treated as a cache miss.
         * For arbitrary Python objects, pass
-          :class:`~pysilience.cache_serializer.HmacPickleSerializer` as
+          :class:`~pysilience.cache_serializer_hmac.HmacPickleSerializer` as
           *serializer*.
         * ``max_size`` from :class:`~pysilience.cache.CacheConfig` is **not**
           enforced by this backend — Redis manages its own memory and eviction

@@ -26,11 +26,9 @@ from pysilience.cache import (
     CacheEventType,
 )
 from pysilience.cache_redis import RedisBackend, _serialise_key
-from pysilience.cache_serializer import (
-    CacheSerializer,
-    HmacPickleSerializer,
-    JsonSerializer,
-)
+from pysilience.cache_serializer import CacheSerializer
+from pysilience.cache_serializer_hmac import HmacPickleSerializer
+from pysilience.cache_serializer_json import JsonSerializer
 
 # ---------------------------------------------------------------------------
 # Shared serializers

@@ -52,7 +52,8 @@ from pysilience.cache import (
     cache,
     create_cache,
 )
-from pysilience.cache_serializer import CacheSerializer, JsonSerializer
+from pysilience.cache_serializer import CacheSerializer
+from pysilience.cache_serializer_json import JsonSerializer
 from pysilience.circuitbreaker import (
     CircuitBreaker,
     CircuitBreakerConfig,
