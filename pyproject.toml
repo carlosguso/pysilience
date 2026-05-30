@@ -40,6 +40,9 @@ dependencies = []
 redis = [
     "redis>=5.0",
 ]
+msgpack = [
+    "msgpack>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -47,6 +50,7 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.8",
     "redis>=5.0",
+    "msgpack>=1.0",
 ]
 
 [project.urls]
