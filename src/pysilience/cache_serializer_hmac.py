@@ -32,7 +32,8 @@ def _verify_and_load(raw: bytes, secret: bytes) -> Any:
     """Verify the HMAC-SHA256 signature and unpickle the payload.
 
     Raises :class:`ValueError` if the signature is absent, too short, or
-    does not match — indicating corruption, tampering, or unsigned legacy data.
+    does not match — indicating corruption, tampering, or unsigned legacy data
+    — or if the signed pickle payload cannot be decoded.
     """
     if len(raw) < _HMAC_DIGEST_SIZE:
         raise ValueError(
@@ -45,7 +46,10 @@ def _verify_and_load(raw: bytes, secret: bytes) -> Any:
         raise ValueError(
             "Cache entry signature mismatch — possible tampering or secret rotation"
         )
-    return pickle.loads(payload)  # noqa: S301
+    try:
+        return pickle.loads(payload)  # noqa: S301
+    except pickle.UnpicklingError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 class HmacPickleSerializer(CacheSerializer):

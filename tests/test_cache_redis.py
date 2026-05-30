@@ -27,7 +27,7 @@ from pysilience.cache import (
 )
 from pysilience.cache_redis import RedisBackend, _serialise_key
 from pysilience.cache_serializer import CacheSerializer
-from pysilience.cache_serializer_hmac import HmacPickleSerializer
+from pysilience.cache_serializer_hmac import HmacPickleSerializer, _sign
 from pysilience.cache_serializer_json import JsonSerializer
 
 # ---------------------------------------------------------------------------
@@ -314,6 +314,12 @@ class TestHmacPickleSerializer:
         with pytest.raises(ValueError):
             _HMAC.loads(raw_pickle)
 
+    def test_corrupt_pickle_payload_raises_value_error(self) -> None:
+        """Valid HMAC over invalid pickle bytes raises ValueError, not UnpicklingError."""
+        signed = _sign(b"not-valid-pickle", _SECRET)
+        with pytest.raises(ValueError, match="invalid load key"):
+            _HMAC.loads(signed)
+
 
 # ============================================================================
 # SYNC OPERATIONS
@@ -361,6 +367,17 @@ class TestSyncOperations:
         """Unsigned legacy pickle data is discarded as a miss."""
         client = _make_sync_client()
         client.get.return_value = pickle.dumps("old_value", protocol=5)
+        backend = RedisBackend(
+            sync_client=client,
+            serializer=HmacPickleSerializer(secret=_SECRET),
+        )
+
+        assert backend.get("k") is _MISS
+
+    def test_get_hmac_corrupt_pickle_returns_miss(self) -> None:
+        """Valid HMAC over corrupt pickle is discarded as a cache miss."""
+        client = _make_sync_client()
+        client.get.return_value = _sign(b"not-valid-pickle", _SECRET)
         backend = RedisBackend(
             sync_client=client,
             serializer=HmacPickleSerializer(secret=_SECRET),
