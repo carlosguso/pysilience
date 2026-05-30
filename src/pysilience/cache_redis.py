@@ -2,7 +2,7 @@
 Pysilience - Redis Cache Backend
 =================================
 A :class:`~pysilience.cache.CacheBackend` backed by Redis, providing
-distributed caching with pickle serialisation.
+distributed caching with pluggable value serialisation.
 
 Requires the ``redis`` package (``pip install pysilience[redis]``).
 
@@ -11,23 +11,54 @@ Usage::
     import redis
     from pysilience import Cache, CacheConfig
     from pysilience.cache_redis import RedisBackend
+    from pysilience.cache_serializer import HmacPickleSerializer
 
-    # Sync-only
-    backend = RedisBackend(sync_client=redis.Redis())
+    # Default: HMAC-signed pickle (secret required)
+    backend = RedisBackend(sync_client=redis.Redis(), secret=b"my-secret-key")
     c = Cache(CacheConfig(ttl=300), backend=backend, name="users")
     val = c.execute("user:42", lambda: fetch_user(42))
 
+    # Explicit serializer
+    serializer = HmacPickleSerializer(secret=b"my-secret-key")
+    backend = RedisBackend(sync_client=redis.Redis(), serializer=serializer)
+
+    # Custom serializer
+    class JsonSerializer:
+        def dumps(self, value): return json.dumps(value).encode()
+        def loads(self, raw): return json.loads(raw.decode())
+
+    backend = RedisBackend(sync_client=redis.Redis(), serializer=JsonSerializer())
+
     # Async-only
     import redis.asyncio as aioredis
-    backend = RedisBackend(async_client=aioredis.Redis())
+    backend = RedisBackend(async_client=aioredis.Redis(), secret=b"my-secret-key")
     val = await c.execute_async("user:42", lambda: async_fetch_user(42))
+
+    # Secret via environment variable (recommended for production)
+    # export PYSILIENCE_CACHE_SECRET="<hex string from: python -c 'import secrets; print(secrets.token_hex(32))'>"
+    backend = RedisBackend(sync_client=redis.Redis())  # reads secret from env
+
+Security note
+-------------
+The default :class:`~pysilience.cache_serializer.HmacPickleSerializer` uses
+:mod:`pickle` (protocol 5) protected by an HMAC-SHA256 signature stored as a
+32-byte prefix.  Every ``get`` / ``aget`` call verifies the signature before
+unpickling, so a compromised Redis server cannot achieve remote code execution
+through crafted payloads.
+
+**A signing secret is mandatory for the default serializer.**  Pass it as
+*secret* or set the ``PYSILIENCE_CACHE_SECRET`` environment variable.  Generate
+a suitable value with::
+
+    python -c "import secrets; print(secrets.token_hex(32))"
 
 License: MIT
 """
 
 from __future__ import annotations
 
-import pickle
+import hashlib
+import logging
 from collections.abc import Hashable
 from typing import Any
 
@@ -41,17 +72,38 @@ except ImportError as _import_err:
     ) from _import_err
 
 from pysilience.cache import _MISS
+from pysilience.cache_serializer import CacheSerializer, HmacPickleSerializer
 
-__all__ = ["RedisBackend"]
+__all__ = ["RedisBackend", "CacheSerializer", "HmacPickleSerializer"]
+
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Key serialisation
+# ---------------------------------------------------------------------------
 
 
 def _serialise_key(key: Hashable, prefix: str) -> str:
-    """Convert a hashable cache key to a Redis string key."""
-    return prefix + pickle.dumps(key).hex()
+    """Convert a hashable cache key to a stable Redis string key.
+
+    Uses a SHA-256 hex digest of the key's ``repr`` so the output is:
+    - version-independent (no pickle format drift across Python releases)
+    - fixed-length (64 hex chars) regardless of key complexity
+    - safe for use as a Redis key without escaping
+    """
+    key_bytes = repr(key).encode()
+    digest = hashlib.sha256(key_bytes).hexdigest()
+    return prefix + digest
+
+
+# ---------------------------------------------------------------------------
+# Backend
+# ---------------------------------------------------------------------------
 
 
 class RedisBackend:
-    """Redis-backed cache storage.
+    """Redis-backed cache storage with pluggable value serialisation.
 
     At least one of *sync_client* and *async_client* must be provided.
     Calling a sync method when only an async client was given (or vice
@@ -61,16 +113,26 @@ class RedisBackend:
         sync_client: A ``redis.Redis`` instance for synchronous operations.
         async_client: A ``redis.asyncio.Redis`` instance for async operations.
         prefix: Key prefix for namespacing within the Redis database.
+        serializer: A :class:`~pysilience.cache_serializer.CacheSerializer` used to
+            encode and decode stored values.  Defaults to
+            :class:`~pysilience.cache_serializer.HmacPickleSerializer`.
+        secret: Convenience argument for the default
+            :class:`~pysilience.cache_serializer.HmacPickleSerializer` when
+            *serializer* is omitted.  Ignored when an explicit *serializer*
+            is provided.  Falls back to the ``PYSILIENCE_CACHE_SECRET``
+            environment variable.
 
     Notes:
-        * Values are serialised with :mod:`pickle` (protocol 5).
+        * By default, values are serialised with HMAC-signed pickle.
+          Invalid or tampered entries are logged as a warning and treated as a
+          cache miss (safe migration from unsigned legacy data).
         * ``max_size`` from :class:`~pysilience.cache.CacheConfig` is **not**
-          enforced by this backend -- Redis manages its own memory and
-          eviction policy.
+          enforced by this backend — Redis manages its own memory and eviction
+          policy.
         * ``ttl`` is applied natively via Redis ``SETEX``.
     """
 
-    __slots__ = ("_sync", "_async", "_prefix")
+    __slots__ = ("_sync", "_async", "_prefix", "_serializer")
 
     def __init__(
         self,
@@ -78,12 +140,24 @@ class RedisBackend:
         async_client: redis.asyncio.Redis | None = None,  # type: ignore[type-arg]
         *,
         prefix: str = "pysilience:",
+        serializer: CacheSerializer | None = None,
+        secret: bytes | str | None = None,
     ) -> None:
         if sync_client is None and async_client is None:
             raise ValueError("At least one of sync_client or async_client must be provided")
+
+        if serializer is not None and not isinstance(serializer, CacheSerializer):
+            raise TypeError(
+                f"serializer must implement CacheSerializer (dumps/loads), "
+                f"got {type(serializer).__name__!r}"
+            )
+
         self._sync = sync_client
         self._async = async_client
         self._prefix = prefix
+        self._serializer: CacheSerializer = (
+            serializer if serializer is not None else HmacPickleSerializer(secret=secret)
+        )
 
     def _require_sync(self) -> redis.Redis:  # type: ignore[type-arg]
         if self._sync is None:
@@ -104,20 +178,30 @@ class RedisBackend:
     def _key(self, key: Hashable) -> str:
         return _serialise_key(key, self._prefix)
 
+    def _load(self, raw: bytes, key: Hashable) -> Any:
+        """Deserialize *raw*; return ``_MISS`` on failure."""
+        try:
+            return self._serializer.loads(raw)
+        except ValueError as exc:
+            _log.warning(
+                "RedisBackend: discarding cache entry for key %r — %s", key, exc
+            )
+            return _MISS
+
     # -- sync ----------------------------------------------------------------
 
     def get(self, key: Hashable) -> Any:
-        """Fetch *key* from Redis.  Returns ``_MISS`` if absent."""
+        """Fetch *key* from Redis.  Returns ``_MISS`` if absent or invalid."""
         client = self._require_sync()
         raw: bytes | None = client.get(self._key(key))
         if raw is None:
             return _MISS
-        return pickle.loads(raw)  # noqa: S301
+        return self._load(raw, key)
 
     def put(self, key: Hashable, value: Any, ttl: float | None = None) -> None:
         """Store *value* under *key*, optionally with a TTL (seconds)."""
         client = self._require_sync()
-        data = pickle.dumps(value, protocol=5)
+        data = self._serializer.dumps(value)
         if ttl is not None:
             client.setex(self._key(key), int(max(ttl, 1)), data)
         else:
@@ -132,6 +216,10 @@ class RedisBackend:
         """Remove all keys matching this backend's prefix.
 
         Uses ``SCAN`` to avoid blocking Redis with ``KEYS``.
+
+        Note: keys inserted between SCAN pages may not be removed.
+        For production use, consider prefix rotation instead of ``clear()``:
+        ``backend._prefix = f"pysilience:{int(time.time())}:"``
         """
         client = self._require_sync()
         cursor: int = 0
@@ -151,12 +239,12 @@ class RedisBackend:
         raw: bytes | None = await client.get(self._key(key))
         if raw is None:
             return _MISS
-        return pickle.loads(raw)  # noqa: S301
+        return self._load(raw, key)
 
     async def aput(self, key: Hashable, value: Any, ttl: float | None = None) -> None:
         """Async :meth:`put`."""
         client = self._require_async()
-        data = pickle.dumps(value, protocol=5)
+        data = self._serializer.dumps(value)
         if ttl is not None:
             await client.setex(self._key(key), int(max(ttl, 1)), data)
         else:

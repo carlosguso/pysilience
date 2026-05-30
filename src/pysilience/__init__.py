@@ -52,6 +52,7 @@ from pysilience.cache import (
     cache,
     create_cache,
 )
+from pysilience.cache_serializer import CacheSerializer
 from pysilience.circuitbreaker import (
     CircuitBreaker,
     CircuitBreakerConfig,
@@ -173,6 +174,7 @@ __all__ = [
     "CacheConfig",
     "CacheEvent",
     "CacheEventType",
+    "CacheSerializer",
     "MemoryBackend",
     "create_cache",
 ]
