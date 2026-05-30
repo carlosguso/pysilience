@@ -15,12 +15,41 @@ import hmac
 import json
 import os
 import pickle
+from collections.abc import Callable
+from datetime import date, datetime, time
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = ["CacheSerializer", "HmacPickleSerializer", "JsonSerializer"]
 
 # SHA-256 produces a 32-byte digest; we prepend it to every stored value.
 _HMAC_DIGEST_SIZE = 32
+
+# Type-envelope keys (non-primitive values only; plain JSON types are stored as-is).
+_TYPE_KEY = "__pysilience_type__"
+_DATA_KEY = "data"
+
+# Registry entry: (encode_fn, decode_fn)
+_TypeHandler = tuple[Callable[[Any], Any], Callable[[Any], Any]]
+_type_registry: dict[str, _TypeHandler] = {}
+
+
+def _type_key(cls: type) -> str:
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _register_type(
+    cls: type,
+    encode: Callable[[Any], Any],
+    decode: Callable[[Any], Any],
+) -> None:
+    _type_registry[_type_key(cls)] = (encode, decode)
+
+
+# Built-in type handlers (may be replaced via :meth:`JsonSerializer.register`).
+_register_type(bytes, lambda b: base64.b64encode(b).decode("ascii"), lambda s: base64.b64decode(s))
+_register_type(datetime, lambda d: d.isoformat(), lambda s: datetime.fromisoformat(s))
+_register_type(date, lambda d: d.isoformat(), lambda s: date.fromisoformat(s))
+_register_type(time, lambda t: t.isoformat(), lambda s: time.fromisoformat(s))
 
 
 # ---------------------------------------------------------------------------
@@ -56,15 +85,23 @@ class CacheSerializer(Protocol):
 # JSON
 # ---------------------------------------------------------------------------
 
-_BYTES_TAG = "__pysilience_bytes__"
-
 
 class JsonSerializer(CacheSerializer):
     """JSON serialisation for cache values.
 
-    Supports standard JSON types (``dict``, ``list``, ``str``, ``int``,
-    ``float``, ``bool``, ``None``).  :class:`bytes` values are encoded as
-    base64-wrapped objects and restored transparently on load.
+    Standard JSON types (``dict``, ``list``, ``str``, ``int``, ``float``,
+    ``bool``, ``None``) are stored as-is with no wrapper.  Non-primitive
+    types (``datetime``, ``date``, ``time``, ``bytes``, and user-registered
+    classes) are wrapped in a type envelope::
+
+        {
+            "__pysilience_type__": "datetime.datetime",
+            "data": "2025-01-01T12:00:00"
+        }
+
+    Built-in handlers for ``datetime``, ``date``, ``time``, and ``bytes`` are
+    registered at import time but may be **overridden** by calling
+    :meth:`register` with the same type.  Register custom types the same way.
     """
 
     __slots__ = ()
@@ -80,17 +117,55 @@ class JsonSerializer(CacheSerializer):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(str(exc)) from exc
 
+    @classmethod
+    def register(
+        cls,
+        typ: type,
+        *,
+        encode: Callable[[Any], Any],
+        decode: Callable[[Any], Any],
+    ) -> None:
+        """Register or override envelope serialisation for *typ*.
+
+        Replaces any existing handler for *typ*, including built-in handlers
+        for ``datetime``, ``date``, ``time``, and ``bytes``.  *encode* must
+        return JSON-serialisable *data*; *decode* reconstructs the object
+        from that *data*.
+        """
+        _register_type(typ, encode, decode)
+
+    @classmethod
+    def unregister(cls, typ: type) -> None:
+        """Remove *typ* from the type registry (mainly for tests)."""
+        _type_registry.pop(_type_key(typ), None)
+
     @staticmethod
     def _encode(obj: Any) -> Any:
-        if isinstance(obj, bytes):
-            return {_BYTES_TAG: base64.b64encode(obj).decode("ascii")}
-        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+        key = _type_key(obj.__class__)
+        entry = _type_registry.get(key)
+        if entry is None:
+            raise TypeError(
+                f"Object of type {obj.__class__.__qualname__!r} is not JSON serializable. "
+                f"Register it with JsonSerializer.register() or use HmacPickleSerializer."
+            )
+        encode_fn, _ = entry
+        return {
+            _TYPE_KEY: key,
+            _DATA_KEY: encode_fn(obj),
+        }
 
     @staticmethod
     def _decode(obj: dict[str, Any]) -> Any:
-        if set(obj) == {_BYTES_TAG} and isinstance(obj[_BYTES_TAG], str):
-            return base64.b64decode(obj[_BYTES_TAG])
-        return obj
+        if set(obj) != {_TYPE_KEY, _DATA_KEY}:
+            return obj
+        type_key = obj[_TYPE_KEY]
+        if not isinstance(type_key, str):
+            return obj
+        entry = _type_registry.get(type_key)
+        if entry is None:
+            raise ValueError(f"Unknown pysilience type envelope: {type_key!r}")
+        _, decode_fn = entry
+        return decode_fn(obj[_DATA_KEY])
 
 
 # ---------------------------------------------------------------------------

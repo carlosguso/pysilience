@@ -9,8 +9,10 @@ Run with: pytest tests/test_cache_redis.py -v
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pickle
+from datetime import date, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -187,6 +189,77 @@ class TestJsonSerializer:
     def test_round_trip(self) -> None:
         value = {"hello": "world", "n": 42, "ok": True, "empty": None}
         assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_primitives_have_no_envelope(self) -> None:
+        raw = _JSON.dumps({"a": 1, "b": [True, None]})
+        assert b"__pysilience_type__" not in raw
+
+    def test_datetime_round_trip(self) -> None:
+        value = datetime(2025, 6, 15, 14, 30, 0)
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_date_round_trip(self) -> None:
+        value = date(2025, 6, 15)
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_nested_datetime_in_dict(self) -> None:
+        ts = datetime(2025, 1, 1, 12, 0, 0)
+        value = {"user": "alice", "created_at": ts}
+        assert _JSON.loads(_JSON.dumps(value)) == value
+
+    def test_custom_type_registration(self) -> None:
+        class UserProfile:
+            __slots__ = ("name",)
+
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def __eq__(self, other: object) -> bool:
+                return isinstance(other, UserProfile) and self.name == other.name
+
+        JsonSerializer.register(
+            UserProfile,
+            encode=lambda u: {"name": u.name},
+            decode=lambda d: UserProfile(d["name"]),
+        )
+        try:
+            profile = UserProfile("alice")
+            assert _JSON.loads(_JSON.dumps(profile)) == profile
+        finally:
+            JsonSerializer.unregister(UserProfile)
+
+    def test_override_builtin_datetime(self) -> None:
+        """Built-in handlers can be replaced via register()."""
+        original = _JSON.loads(_JSON.dumps(datetime(2025, 1, 1, 12, 0, 0)))
+
+        JsonSerializer.register(
+            datetime,
+            encode=lambda d: d.timestamp(),
+            decode=lambda ts: datetime.fromtimestamp(ts),
+        )
+        try:
+            value = datetime(2025, 6, 15, 14, 30, 0)
+            raw = _JSON.dumps(value)
+            assert b"__pysilience_ver__" not in raw
+            assert _JSON.loads(raw) == value
+        finally:
+            JsonSerializer.register(
+                datetime,
+                encode=lambda d: d.isoformat(),
+                decode=lambda s: datetime.fromisoformat(s),
+            )
+
+        assert _JSON.loads(_JSON.dumps(original)) == original
+
+    def test_unknown_envelope_raises(self) -> None:
+        payload = json.dumps(
+            {
+                "__pysilience_type__": "myapp.models.UserProfile",
+                "data": {"name": "alice"},
+            }
+        ).encode()
+        with pytest.raises(ValueError, match="Unknown pysilience type"):
+            _JSON.loads(payload)
 
     def test_bytes_round_trip(self) -> None:
         value = b"\x00\x01\xff"
