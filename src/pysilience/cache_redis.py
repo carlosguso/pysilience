@@ -23,8 +23,14 @@ Usage::
     backend = RedisBackend(sync_client=redis.Redis(), serializer=serializer)
 
     # MessagePack (compact binary; pip install pysilience[msgpack])
+    from datetime import datetime
     from pysilience.cache_serializer_msgpack import MsgpackSerializer
-    backend = RedisBackend(sync_client=redis.Redis(), serializer=MsgpackSerializer())
+    from pysilience.cache_serializer_msgpack_builtins import (
+        pack_datetime, unpack_datetime,
+    )
+    serializer = MsgpackSerializer()
+    serializer.register_type(datetime, type_id=64, pack=pack_datetime, unpack=unpack_datetime)
+    backend = RedisBackend(sync_client=redis.Redis(), serializer=serializer)
 
     # Custom serializer
     class PlainSerializer:

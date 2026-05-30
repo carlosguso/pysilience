@@ -8,6 +8,7 @@ Concrete implementations live in sibling modules:
 - :mod:`pysilience.cache_serializer_json` — :class:`~pysilience.cache_serializer_json.JsonSerializer`
 - :mod:`pysilience.cache_serializer_hmac` — :class:`~pysilience.cache_serializer_hmac.HmacPickleSerializer`
 - :mod:`pysilience.cache_serializer_msgpack` — :class:`~pysilience.cache_serializer_msgpack.MsgpackSerializer`
+- :mod:`pysilience.cache_serializer_msgpack_builtins` — optional msgpack handlers for common types
 
 License: MIT
 """
