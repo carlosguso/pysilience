@@ -18,6 +18,7 @@ from pysilience.timeout import (
     TimeoutConfig,
     TimeoutEvent,
     TimeoutEventType,
+    _DEFAULT_EXECUTOR,
     timeout,
 )
 
@@ -169,6 +170,23 @@ class TestSyncTimeout:
             f"Timeout should return promptly, got {elapsed:.2f}s "
             f"(expected < {timeout_duration + 0.5}s)"
         )
+
+    def test_uses_shared_executor_by_default(self) -> None:
+        """Default Timeout instances share the module-level executor."""
+        t1 = Timeout(TimeoutConfig(duration=1.0))
+        t2 = Timeout(TimeoutConfig(duration=1.0))
+        assert t1._executor is _DEFAULT_EXECUTOR
+        assert t2._executor is t1._executor
+
+    def test_execute_does_not_create_per_call_executor(self) -> None:
+        """Sync execute() reuses the instance executor instead of creating one per call."""
+        t = Timeout(TimeoutConfig(duration=0.1, use_signals=False))
+
+        with patch(
+            "pysilience.timeout.concurrent.futures.ThreadPoolExecutor"
+        ) as mock_executor_cls:
+            t.execute(lambda: "ok")
+            mock_executor_cls.assert_not_called()
 
 
 # ============================================================================
@@ -356,19 +374,33 @@ class TestTimeoutClass:
         t = Timeout(TimeoutConfig(duration=42.0))
         assert t.duration == 42.0
 
-    def test_executor_shutdown_when_submit_raises(self) -> None:
-        """Executor is shut down even when submit() raises."""
+    def test_shutdown_custom_executor(self) -> None:
+        """shutdown() shuts down a custom executor passed at construction."""
+        mock_executor = MagicMock()
+        t = Timeout(TimeoutConfig(duration=1.0), executor=mock_executor)
+
+        t.shutdown()
+        mock_executor.shutdown.assert_called_once_with(wait=True)
+
+        mock_executor.shutdown.reset_mock()
+        t.shutdown()
+        mock_executor.shutdown.assert_not_called()
+
+    def test_shutdown_default_executor_is_noop(self) -> None:
+        """shutdown() is a no-op when using the shared default executor."""
         t = Timeout(TimeoutConfig(duration=1.0))
+        t.shutdown()
+
+    def test_submit_error_does_not_shutdown_executor(self) -> None:
+        """Executor is not shut down per call when submit() raises."""
         mock_executor = MagicMock()
         mock_executor.submit.side_effect = RuntimeError("submit failed")
+        t = Timeout(TimeoutConfig(duration=1.0), executor=mock_executor)
 
-        with patch(
-            "pysilience.timeout.concurrent.futures.ThreadPoolExecutor",
-            return_value=mock_executor,
-        ), pytest.raises(RuntimeError, match="submit failed"):
+        with pytest.raises(RuntimeError, match="submit failed"):
             t.execute(lambda: "ok")
 
-        mock_executor.shutdown.assert_called_once()
+        mock_executor.shutdown.assert_not_called()
 
 
 # ============================================================================
