@@ -22,6 +22,7 @@ License: MIT
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import contextlib
 import functools
@@ -58,6 +59,13 @@ __all__ = [
 P = ParamSpec("P")
 R = TypeVar("R")
 T = TypeVar("T")
+
+_DEFAULT_THREAD_POOL_SIZE = 32
+_DEFAULT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_DEFAULT_THREAD_POOL_SIZE,
+    thread_name_prefix="pysilience-timeout",
+)
+atexit.register(_DEFAULT_EXECUTOR.shutdown, wait=False)
 
 
 # ============================================================================
@@ -183,17 +191,24 @@ class Timeout(Generic[P, R]):
         config: TimeoutConfig | None = None,
         *,
         name: str | None = None,
+        executor: concurrent.futures.ThreadPoolExecutor | None = None,
     ) -> None:
         """Initialize the Timeout.
 
         Args:
             config: Configuration for timeout behavior. Uses defaults if None.
             name: Optional name for this timeout instance (for logging/metrics).
+            executor: Optional thread pool for sync timeouts. When omitted, a
+                shared bounded pool is used. Pass a custom executor only when
+                you need isolated concurrency limits; call :meth:`shutdown`
+                when done with a custom executor.
         """
         self.config = config or TimeoutConfig()
         self.name = name or "timeout"
         self._event_listeners: list[Callable[[TimeoutEvent], None]] = []
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._owns_executor = executor is not None
+        self._executor = executor or _DEFAULT_EXECUTOR
 
     @property
     def duration(self) -> float:
@@ -207,6 +222,16 @@ class Timeout(Generic[P, R]):
             listener: Callback function that receives TimeoutEvent objects.
         """
         self._event_listeners.append(listener)
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Shut down a custom executor passed at construction.
+
+        No-op when using the shared default executor. The default pool is
+        shut down automatically at process exit.
+        """
+        if self._owns_executor:
+            self._executor.shutdown(wait=wait)
+            self._owns_executor = False
 
     def _emit_event(self, event: TimeoutEvent) -> None:
         """Emit an event to all registered listeners."""
@@ -241,10 +266,8 @@ class Timeout(Generic[P, R]):
 
     def _execute_with_thread(self, func: Callable[[], R], start_time: float) -> R:
         """Execute using a thread pool for timeout (works everywhere)."""
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        timed_out = False
+        future = self._executor.submit(func)
         try:
-            future = executor.submit(func)
             result = future.result(timeout=self.config.duration)
             elapsed = time.monotonic() - start_time
             self._emit_event(
@@ -257,7 +280,7 @@ class Timeout(Generic[P, R]):
             )
             return result
         except concurrent.futures.TimeoutError:
-            timed_out = True
+            future.cancel() # Best effort to cancel the thread, but it may continue running.
             elapsed = time.monotonic() - start_time
             error = OperationTimeout(
                 f"Operation timed out after {elapsed:.2f}s",
@@ -287,9 +310,6 @@ class Timeout(Generic[P, R]):
                 )
             )
             raise
-        finally:
-            # wait=False on timeout returns control promptly; worker continues in background
-            executor.shutdown(wait=not timed_out)
 
     def _execute_with_signal(self, func: Callable[[], R], start_time: float) -> R:
         """Execute using SIGALRM for timeout (Unix main thread only)."""
